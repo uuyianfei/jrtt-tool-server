@@ -1,4 +1,5 @@
 import logging
+from datetime import datetime
 
 from apscheduler.schedulers.background import BackgroundScheduler
 
@@ -37,6 +38,7 @@ class AppScheduler:
             id="crawl_job",
             replace_existing=True,
             max_instances=1,
+            next_run_time=datetime.now(),
         )
         self.scheduler.add_job(
             cleanup_wrapper,
@@ -45,6 +47,7 @@ class AppScheduler:
             id="cleanup_job",
             replace_existing=True,
             max_instances=1,
+            next_run_time=datetime.now(),
         )
 
     def start(self):

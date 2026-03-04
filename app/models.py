@@ -10,7 +10,8 @@ class Article(db.Model):
 
     id = db.Column(db.Integer, primary_key=True)
     article_id = db.Column(db.String(64), unique=True, nullable=False, index=True)
-    url = db.Column(db.String(1024), unique=True, nullable=False)
+    url_hash = db.Column(db.String(64), unique=True, nullable=False, index=True)
+    url = db.Column(db.String(1024), nullable=False)
     title = db.Column(db.String(255), nullable=False, default="")
     cover = db.Column(db.String(1024), nullable=False, default="")
     author = db.Column(db.String(128), nullable=False, default="")

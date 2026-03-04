@@ -1,4 +1,5 @@
 import re
+import hashlib
 from datetime import datetime, timedelta
 
 from flask import jsonify
@@ -29,6 +30,10 @@ def parse_number(text: str) -> int:
         return int(float(cleaned)) if cleaned else 0
     except ValueError:
         return 0
+
+
+def sha256_hex(text: str) -> str:
+    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
 
 
 def format_compact_number(num: int) -> str:

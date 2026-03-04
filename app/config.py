@@ -1,4 +1,5 @@
 import os
+from urllib.parse import quote_plus
 
 from dotenv import load_dotenv
 
@@ -14,8 +15,10 @@ class Config:
     MYSQL_USER = os.getenv("MYSQL_USER", "root")
     MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD", "root")
     MYSQL_DB = os.getenv("MYSQL_DB", "jrtt_tool")
+    MYSQL_USER_ENCODED = quote_plus(MYSQL_USER)
+    MYSQL_PASSWORD_ENCODED = quote_plus(MYSQL_PASSWORD)
     SQLALCHEMY_DATABASE_URI = (
-        f"mysql+pymysql://{MYSQL_USER}:{MYSQL_PASSWORD}@{MYSQL_HOST}:{MYSQL_PORT}/{MYSQL_DB}"
+        f"mysql+pymysql://{MYSQL_USER_ENCODED}:{MYSQL_PASSWORD_ENCODED}@{MYSQL_HOST}:{MYSQL_PORT}/{MYSQL_DB}"
         "?charset=utf8mb4"
     )
     SQLALCHEMY_TRACK_MODIFICATIONS = False
@@ -23,8 +26,15 @@ class Config:
     CRAWL_INTERVAL_SECONDS = int(os.getenv("CRAWL_INTERVAL_SECONDS", "120"))
     CLEANUP_INTERVAL_MINUTES = int(os.getenv("CLEANUP_INTERVAL_MINUTES", "30"))
     CRAWL_TARGET_COUNT = int(os.getenv("CRAWL_TARGET_COUNT", "20"))
+    CRAWL_LIST_SCROLL_ROUNDS = int(os.getenv("CRAWL_LIST_SCROLL_ROUNDS", "6"))
     CRAWL_MAX_HOURS = float(os.getenv("CRAWL_MAX_HOURS", "24"))
     CRAWL_MAX_FANS = int(os.getenv("CRAWL_MAX_FANS", "10000"))
+    CRAWL_BLOCK_AUTHOR_KEYWORDS = os.getenv(
+        "CRAWL_BLOCK_AUTHOR_KEYWORDS",
+        "政府,检察院,法院,公安,交警,消防,税务,纪委,共青团,网信办,发布,融媒体中心",
+    )
+    CHROMEDRIVER_PATH = os.getenv("CHROMEDRIVER_PATH", "")
+    CHROME_BINARY_PATH = os.getenv("CHROME_BINARY_PATH", "")
     CRAWL_HEADLESS = os.getenv("CRAWL_HEADLESS", "true").lower() == "true"
     TOUTIAO_URL = os.getenv("TOUTIAO_URL", "https://www.toutiao.com/")
 

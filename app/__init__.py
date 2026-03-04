@@ -13,6 +13,10 @@ from .utils import error_response, success_response
 def create_app() -> Flask:
     app = Flask(__name__)
     app.config.from_object(Config)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s - %(message)s",
+    )
 
     db.init_app(app)
 
@@ -37,5 +41,6 @@ def create_app() -> Flask:
 
     scheduler.init_app(app)
     scheduler.start()
+    app.logger.info("Scheduler started")
 
     return app

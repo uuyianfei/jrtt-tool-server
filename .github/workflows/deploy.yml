@@ -1,0 +1,49 @@
+name: Deploy To Server
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Deploy by SSH (username + password)
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          port: ${{ secrets.SSH_PORT }}
+          username: ${{ secrets.SSH_USER }}
+          password: ${{ secrets.SSH_PASSWORD }}
+          script_stop: true
+          envs: DEPLOY_APP_DIR,DEPLOY_BRANCH
+          script: |
+            set -e
+            if [ -z "$DEPLOY_APP_DIR" ]; then
+              DEPLOY_APP_DIR=/home/jrtt-toolserver
+            fi
+            if [ -z "$DEPLOY_BRANCH" ]; then
+              DEPLOY_BRANCH=main
+            fi
+
+            if [ ! -d "$DEPLOY_APP_DIR/.git" ]; then
+              echo "Git repo not found in $DEPLOY_APP_DIR"
+              echo "Please clone your repo on server first."
+              exit 1
+            fi
+
+            cd "$DEPLOY_APP_DIR"
+            git fetch --all
+            git reset --hard "origin/$DEPLOY_BRANCH"
+
+            docker compose down || true
+            docker compose up -d --build
+            docker compose ps
+        env:
+          DEPLOY_APP_DIR: /home/jrtt-toolserver
+          DEPLOY_BRANCH: main
