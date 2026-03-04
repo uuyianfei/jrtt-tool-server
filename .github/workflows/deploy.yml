@@ -38,7 +38,24 @@ jobs:
             fi
 
             cd "$DEPLOY_APP_DIR"
-            git fetch --all
+            # 网络抖动时，git over https 容易出现 GnuTLS EOF，做兼容配置 + 重试
+            git config --local http.version HTTP/1.1
+            git config --local http.postBuffer 524288000
+
+            n=0
+            until [ "$n" -ge 3 ]
+            do
+              git fetch --all --prune && break
+              n=$((n+1))
+              echo "git fetch failed, retry $n/3..."
+              sleep 5
+            done
+
+            if [ "$n" -ge 3 ]; then
+              echo "git fetch --all failed after retries, fallback to shallow fetch"
+              git fetch origin "$DEPLOY_BRANCH" --depth=1
+            fi
+
             git reset --hard "origin/$DEPLOY_BRANCH"
 
             docker compose down || true
