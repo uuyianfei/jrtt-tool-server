@@ -94,7 +94,6 @@ docker compose down
 ### 需要配置的 GitHub Secrets
 
 - `SSH_HOST`：服务器地址
-- `SSH_PORT`：SSH 端口（如 `22`）
 - `SSH_USER`：SSH 登录账号
 - `SSH_PASSWORD`：SSH 登录密码
 
@@ -104,6 +103,7 @@ docker compose down
 - `DEPLOY_BRANCH=main`
 
 因此无需再配置 `DEPLOY_APP_DIR`、`DEPLOY_BRANCH`。
+SSH 端口固定使用默认 `22`，无需配置 `SSH_PORT`。
 
 ### 服务器前置要求
 
