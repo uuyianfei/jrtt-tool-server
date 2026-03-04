@@ -25,7 +25,7 @@ jobs:
           script: |
             set -e
             if [ -z "$DEPLOY_APP_DIR" ]; then
-              DEPLOY_APP_DIR=/home/jrtt-toolserver
+              DEPLOY_APP_DIR=/home/jrtt-server/jrtt-tool-server
             fi
             if [ -z "$DEPLOY_BRANCH" ]; then
               DEPLOY_BRANCH=main
@@ -45,5 +45,5 @@ jobs:
             docker compose up -d --build
             docker compose ps
         env:
-          DEPLOY_APP_DIR: /home/jrtt-toolserver
+          DEPLOY_APP_DIR: /home/jrtt-server/jrtt-tool-server
           DEPLOY_BRANCH: main
