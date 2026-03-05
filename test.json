@@ -1,0 +1,43 @@
+{
+    "success": true,
+    "data": {
+      "total": 2,
+      "success": 1,
+      "failed": 0,
+      "skipped": 0,
+      "not_found": 1,
+      "ignored": 0,
+      "data": [
+        {
+          "row": 1,
+          "masterBillNo": "MBL001",
+          "containerNo": "ABCD1234567",
+          "firmCode": "Y790",
+          "LFD": "2026-03-10",
+          "originalLFD": "",
+          "status": "success",
+          "message": "查询成功",
+          "updateUsTime": "",
+          "termilalPickupStatue": "",
+          "YardStatus": "",
+          "YardPickupDate": "",
+          "holdInformation": [
+            {
+                "hold":"",
+                "status":""
+            }
+          ],
+          "feeInformation": [
+            {
+                "name":"",
+                "value":""
+            }
+          ],
+          "apptPickupDate": ""
+         
+        }
+      ]
+    },
+    "msg": "处理成功",
+    "code": 200
+  }

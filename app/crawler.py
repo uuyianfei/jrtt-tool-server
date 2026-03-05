@@ -2,6 +2,7 @@ import logging
 import os
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List
@@ -480,8 +481,11 @@ class ToutiaoCrawler:
 
 def upsert_articles(items: List[Dict]):
     now = datetime.utcnow()
+    app = current_app._get_current_object()
     max_hours = float(current_app.config["CRAWL_MAX_HOURS"])
     max_fans = int(current_app.config["CRAWL_MAX_FANS"])
+    detail_workers = max(1, int(current_app.config.get("CRAWL_DETAIL_WORKERS", 3)))
+    crawl_headless = bool(current_app.config["CRAWL_HEADLESS"])
     affected = 0
     stats = {
         "total_candidates": len(items),
@@ -491,41 +495,30 @@ def upsert_articles(items: List[Dict]):
         "updated": 0,
         "errors": 0,
     }
+    logger.info("detail workers=%s", detail_workers)
 
-    crawler = ToutiaoCrawler(headless=current_app.config["CRAWL_HEADLESS"])
-    try:
-        for idx, base in enumerate(items, start=1):
-            article_id = base.get("article_id", "")
-            title = (base.get("title") or "")[:40]
+    def enrich_one(base: Dict):
+        article_id = base.get("article_id", "")
+        title = (base.get("title") or "")[:40]
+        with app.app_context():
+            crawler = ToutiaoCrawler(headless=crawl_headless)
             try:
-                logger.info(
-                    "processing [%s/%s] article_id=%s title=%s",
-                    idx,
-                    len(items),
-                    article_id,
-                    title,
-                )
+                logger.info("detail processing article_id=%s title=%s", article_id, title)
                 hours_ago = parse_hours_ago(base.get("publish_time", ""))
                 if hours_ago is None or hours_ago > max_hours:
-                    stats["skip_time"] += 1
-                    logger.info(
-                        "skip article_id=%s reason=time hours_ago=%s max_hours=%s",
-                        article_id,
-                        hours_ago,
-                        max_hours,
-                    )
-                    continue
+                    return {
+                        "status": "skip_time",
+                        "article_id": article_id,
+                        "hours_ago": hours_ago,
+                    }
 
                 fans = crawler._get_author_fans_count(base.get("author_url", ""))
                 if fans >= max_fans:
-                    stats["skip_fans"] += 1
-                    logger.info(
-                        "skip article_id=%s reason=fans fans=%s max_fans=%s",
-                        article_id,
-                        fans,
-                        max_fans,
-                    )
-                    continue
+                    return {
+                        "status": "skip_fans",
+                        "article_id": article_id,
+                        "fans": fans,
+                    }
 
                 details = crawler._get_article_details(base["url"])
                 read_count = crawler._get_article_read_count_from_author(
@@ -534,56 +527,112 @@ def upsert_articles(items: List[Dict]):
                     article_title=base.get("title", ""),
                     article_url=base.get("url", ""),
                 )
-                published_at = now - timedelta(hours=float(hours_ago))
-                url_hash = sha256_hex(base["url"])
-                article = Article.query.filter(
-                    (Article.article_id == base["article_id"]) | (Article.url_hash == url_hash)
-                ).first()
-                is_new = article is None
-                if is_new:
-                    article = Article(article_id=base["article_id"], url_hash=url_hash, url=base["url"])
-                    db.session.add(article)
-                    stats["created"] += 1
-                else:
-                    stats["updated"] += 1
+                return {
+                    "status": "ok",
+                    "article_id": article_id,
+                    "base": base,
+                    "hours_ago": float(hours_ago),
+                    "fans": int(fans),
+                    "details": details,
+                    "read_count": int(read_count or 0),
+                }
+            finally:
+                crawler.close()
 
-                article.title = details.get("title") or base.get("title") or "无标题"
-                article.url_hash = url_hash
-                article.cover = base.get("cover", "")
-                article.author = base.get("author", "")
-                article.author_url = base.get("author_url", "")
-                article.publish_time_text = base.get("publish_time", "")
-                article.published_at = published_at
-                article.published_hours_ago = float(hours_ago)
-                article.followers = int(fans)
-                # 阅读量只采用作者主页作品卡片值（详情页无可靠阅读量）
-                article.view_count = int(read_count or 0)
-                article.like_count = int(details.get("like_count") or 0)
-                article.comment_count = int(
-                    max(
-                        int(details.get("comment_count") or 0),
-                        int(base.get("comment_count") or 0),
+    enrich_results = []
+    with ThreadPoolExecutor(max_workers=detail_workers) as executor:
+        future_map = {executor.submit(enrich_one, base): base for base in items}
+        for future in as_completed(future_map):
+            base = future_map[future]
+            article_id = base.get("article_id", "")
+            try:
+                result = future.result()
+                status = result.get("status")
+                if status == "skip_time":
+                    stats["skip_time"] += 1
+                    logger.info(
+                        "skip article_id=%s reason=time hours_ago=%s max_hours=%s",
+                        article_id,
+                        result.get("hours_ago"),
+                        max_hours,
                     )
-                )
-                article.source_html = details.get("article_html") or ""
-                article.last_seen_at = now
-                affected += 1
-                logger.info(
-                    "upsert success article_id=%s mode=%s fans=%s views=%s likes=%s comments=%s (read_from_author=%s)",
-                    article_id,
-                    "create" if is_new else "update",
-                    article.followers,
-                    article.view_count,
-                    article.like_count,
-                    article.comment_count,
-                    read_count,
-                )
+                    continue
+                if status == "skip_fans":
+                    stats["skip_fans"] += 1
+                    logger.info(
+                        "skip article_id=%s reason=fans fans=%s max_fans=%s",
+                        article_id,
+                        result.get("fans"),
+                        max_fans,
+                    )
+                    continue
+                enrich_results.append(result)
             except Exception as exc:
                 stats["errors"] += 1
-                logger.exception("upsert failed article_id=%s err=%s", article_id, exc)
-        db.session.commit()
-    finally:
-        crawler.close()
+                logger.exception("detail enrich failed article_id=%s err=%s", article_id, exc)
+
+    for idx, item in enumerate(enrich_results, start=1):
+        base = item["base"]
+        article_id = item["article_id"]
+        try:
+            logger.info(
+                "upsert processing [%s/%s] article_id=%s",
+                idx,
+                len(enrich_results),
+                article_id,
+            )
+            hours_ago = float(item["hours_ago"])
+            fans = int(item["fans"])
+            details = item["details"]
+            read_count = int(item["read_count"])
+            published_at = now - timedelta(hours=hours_ago)
+            url_hash = sha256_hex(base["url"])
+            article = Article.query.filter(
+                (Article.article_id == base["article_id"]) | (Article.url_hash == url_hash)
+            ).first()
+            is_new = article is None
+            if is_new:
+                article = Article(article_id=base["article_id"], url_hash=url_hash, url=base["url"])
+                db.session.add(article)
+                stats["created"] += 1
+            else:
+                stats["updated"] += 1
+
+            article.title = details.get("title") or base.get("title") or "无标题"
+            article.url_hash = url_hash
+            article.cover = base.get("cover", "")
+            article.author = base.get("author", "")
+            article.author_url = base.get("author_url", "")
+            article.publish_time_text = base.get("publish_time", "")
+            article.published_at = published_at
+            article.published_hours_ago = float(hours_ago)
+            article.followers = int(fans)
+            # 阅读量只采用作者主页作品卡片值（详情页无可靠阅读量）
+            article.view_count = int(read_count or 0)
+            article.like_count = int(details.get("like_count") or 0)
+            article.comment_count = int(
+                max(
+                    int(details.get("comment_count") or 0),
+                    int(base.get("comment_count") or 0),
+                )
+            )
+            article.source_html = details.get("article_html") or ""
+            article.last_seen_at = now
+            affected += 1
+            logger.info(
+                "upsert success article_id=%s mode=%s fans=%s views=%s likes=%s comments=%s (read_from_author=%s)",
+                article_id,
+                "create" if is_new else "update",
+                article.followers,
+                article.view_count,
+                article.like_count,
+                article.comment_count,
+                read_count,
+            )
+        except Exception as exc:
+            stats["errors"] += 1
+            logger.exception("upsert failed article_id=%s err=%s", article_id, exc)
+    db.session.commit()
     logger.info(
         "upsert summary total=%s affected=%s created=%s updated=%s skip_time=%s skip_fans=%s errors=%s",
         stats["total_candidates"],

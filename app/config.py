@@ -27,6 +27,7 @@ class Config:
     CLEANUP_INTERVAL_MINUTES = int(os.getenv("CLEANUP_INTERVAL_MINUTES", "30"))
     CRAWL_TARGET_COUNT = int(os.getenv("CRAWL_TARGET_COUNT", "20"))
     CRAWL_LIST_SCROLL_ROUNDS = int(os.getenv("CRAWL_LIST_SCROLL_ROUNDS", "6"))
+    CRAWL_DETAIL_WORKERS = int(os.getenv("CRAWL_DETAIL_WORKERS", "3"))
     CRAWL_MAX_HOURS = float(os.getenv("CRAWL_MAX_HOURS", "24"))
     CRAWL_MAX_FANS = int(os.getenv("CRAWL_MAX_FANS", "10000"))
     CRAWL_BLOCK_AUTHOR_KEYWORDS = os.getenv(
