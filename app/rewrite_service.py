@@ -40,7 +40,10 @@ def _rewrite_worker(app, task_id: str):
             time.sleep(1)
             _update_task(task, 70, "AI 正在深度改写中...", 3)
 
-            rewritten_html, suggested_titles = _rewrite_text(source_title, source_text)
+            rewritten_html, suggested_titles = _rewrite_text(source_title, source_text, source_html)
+            rewritten_html, suggested_titles = _post_process_rewrite_output(
+                rewritten_html, suggested_titles, source_title
+            )
             rewritten_html = _inject_source_images(rewritten_html, source_html)
             time.sleep(1)
             _update_task(task, 95, "正在整理结果...", 1)
@@ -70,7 +73,7 @@ def _fetch_source(url: str):
     article = Article.query.filter_by(url=url).first()
     if article and article.source_html:
         title = article.title or "原标题"
-        html = article.source_html
+        html = _sanitize_image_inline_styles(article.source_html)
         return html, title, _html_to_text(html)
 
     headers = {
@@ -83,7 +86,7 @@ def _fetch_source(url: str):
     resp.raise_for_status()
     soup = BeautifulSoup(resp.text, "html.parser")
     container = soup.select_one("article") or soup.select_one(".syl-article-base") or soup.body
-    html = str(container) if container else ""
+    html = _sanitize_image_inline_styles(str(container) if container else "")
     title = ""
     if soup.title and soup.title.string:
         title = soup.title.string.strip()
@@ -101,15 +104,21 @@ def _html_to_text(html: str) -> str:
     return soup.get_text("\n", strip=True)
 
 
-def _rewrite_text(original_title: str, source_text: str):
+def _rewrite_text(original_title: str, source_text: str, source_html: str):
     source_text = source_text[:3000]
     api_key = current_app.config["DEEPSEEK_API_KEY"]
     if api_key:
+        image_guidance = _build_image_guidance(source_html)
         prompt = (
             "请将下面文章改写成口语化、可读性强的中文内容。\n"
             "严格只输出 JSON（不要 markdown 代码块）："
             '{"rewrittenBodyHtml":"<p>...</p>","suggestedTitles":["标题1","标题2","标题3"]}\n'
-            "要求：rewrittenBodyHtml 只放正文，不要包含“标题建议”等段落。\n"
+            "要求：\n"
+            "1) rewrittenBodyHtml 只放正文，不要包含“标题建议”等段落。\n"
+            "2) 必须在 rewrittenBodyHtml 中插入原文图片，使用 <img src=\"...\">。\n"
+            "3) 图片 src 必须完全使用提供的原图 URL，不要改写、不要省略、不要替换。\n"
+            "4) 按原文图片出现位置，插入到改写正文对应段落位置。\n"
+            f"{image_guidance}\n"
             f"原标题：{original_title}\n"
             f"原文：{source_text}"
         )
@@ -226,6 +235,55 @@ def _normalize_html(html: str):
     return "".join([f"<p>{ln}</p>" for ln in lines]) or "<p>暂无改写内容</p>"
 
 
+def _build_image_guidance(source_html: str) -> str:
+    source = BeautifulSoup(source_html or "", "html.parser")
+    img_points, _ = _extract_source_image_points(source)
+    if not img_points:
+        return "原文无图片，可不插图。"
+    lines = ["原文图片清单（按出现顺序）："]
+    for idx, (para_idx, src) in enumerate(img_points, start=1):
+        lines.append(f"{idx}. 段落索引={para_idx}, src={src}")
+        if idx >= 10:
+            break
+    return "\n".join(lines)
+
+
+def _post_process_rewrite_output(rewritten_html: str, suggested_titles, original_title: str):
+    """
+    强制修正 AI 结果：
+    1) 从正文中剥离“标题建议”区块
+    2) 纠正双层 <p><p> 结构
+    3) 优先使用正文中抽到的真实标题，替换占位“改写版”标题
+    """
+    html = rewritten_html or ""
+
+    titles_from_html = []
+    li_titles = re.findall(r"<li[^>]*>(.*?)</li>", html, flags=re.IGNORECASE | re.DOTALL)
+    for raw in li_titles:
+        text = BeautifulSoup(raw, "html.parser").get_text(" ", strip=True)
+        text = re.sub(r"^[\-\d\.\)、\s]+", "", text).strip()
+        if len(text) >= 6 and text not in titles_from_html:
+            titles_from_html.append(text)
+        if len(titles_from_html) >= 3:
+            break
+
+    # 去掉“标题建议”及其后面的内容（正文只保留改写文章）
+    marker_match = re.search(r"(标题建议|推荐标题|备选标题)", html)
+    if marker_match:
+        html = html[: marker_match.start()]
+
+    # 处理嵌套段落：<p><p>xxx</p></p> -> <p>xxx</p>
+    html = re.sub(r"<p>\s*<p>", "<p>", html, flags=re.IGNORECASE)
+    html = re.sub(r"</p>\s*</p>", "</p>", html, flags=re.IGNORECASE)
+    html = _normalize_html(html)
+
+    clean_titles = _normalize_titles(suggested_titles, original_title)
+    looks_placeholder = all(("改写版" in t) for t in clean_titles)
+    if titles_from_html and (looks_placeholder or not clean_titles):
+        clean_titles = _normalize_titles(titles_from_html, original_title)
+    return html, clean_titles
+
+
 def _inject_source_images(rewritten_html: str, source_html: str):
     if not source_html:
         return rewritten_html
@@ -236,9 +294,9 @@ def _inject_source_images(rewritten_html: str, source_html: str):
     if not img_points:
         return str(rewritten)
 
-    # 不使用 AI 返回的图片，统一替换为原文图片
-    for img in rewritten.find_all("img"):
-        img.decompose()
+    # 优先让 AI 自行插入原图；只有 AI 漏图时才做兜底注入
+    if rewritten.find("img"):
+        return _sanitize_image_inline_styles(str(rewritten))
 
     rewritten_paras = rewritten.find_all("p")
     rewritten_para_total = len(rewritten_paras)
@@ -248,7 +306,7 @@ def _inject_source_images(rewritten_html: str, source_html: str):
             p = rewritten.new_tag("p")
             p.append(rewritten.new_tag("img", src=src))
             rewritten.append(p)
-        return str(rewritten)
+        return _sanitize_image_inline_styles(str(rewritten))
 
     inserted_after_index = -1
     for source_para_index, src in img_points:
@@ -266,7 +324,17 @@ def _inject_source_images(rewritten_html: str, source_html: str):
         img_p.append(rewritten.new_tag("img", src=src))
         target_p.insert_after(img_p)
         inserted_after_index = target_index
-    return str(rewritten)
+    return _sanitize_image_inline_styles(str(rewritten))
+
+
+def _sanitize_image_inline_styles(html: str) -> str:
+    if not html:
+        return html
+    soup = BeautifulSoup(html, "html.parser")
+    for img in soup.find_all("img"):
+        if img.has_attr("style"):
+            del img["style"]
+    return str(soup)
 
 
 def _extract_source_image_points(source_soup: BeautifulSoup):
