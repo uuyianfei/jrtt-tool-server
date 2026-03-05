@@ -1,4 +1,5 @@
 import logging
+from datetime import datetime
 
 from flask import Flask
 
@@ -7,16 +8,33 @@ from .extensions import db
 from .routes.articles import articles_bp
 from .routes.rewrite import rewrite_bp
 from .scheduler import scheduler
+from .time_utils import SHANGHAI_TZ
 from .utils import error_response, success_response
+
+
+class ShanghaiFormatter(logging.Formatter):
+    """Force log timestamps to Asia/Shanghai regardless of host timezone."""
+
+    def formatTime(self, record, datefmt=None):
+        dt = datetime.fromtimestamp(record.created, SHANGHAI_TZ)
+        if datefmt:
+            return dt.strftime(datefmt)
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
 
 
 def create_app() -> Flask:
     app = Flask(__name__)
     app.config.from_object(Config)
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s - %(message)s",
-    )
+    log_format = "%(asctime)s %(levelname)s %(name)s - %(message)s"
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    if not root_logger.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(ShanghaiFormatter(log_format))
+        root_logger.addHandler(handler)
+    else:
+        for handler in root_logger.handlers:
+            handler.setFormatter(ShanghaiFormatter(log_format))
 
     db.init_app(app)
 

@@ -3,7 +3,7 @@ import os
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta
+from datetime import timedelta
 from pathlib import Path
 from typing import Dict, List
 
@@ -16,6 +16,7 @@ from webdriver_manager.chrome import ChromeDriverManager
 
 from .extensions import db
 from .models import Article
+from .time_utils import cn_now_naive
 from .utils import parse_hours_ago, parse_number, sha256_hex
 
 
@@ -480,7 +481,7 @@ class ToutiaoCrawler:
 
 
 def upsert_articles(items: List[Dict]):
-    now = datetime.utcnow()
+    now = cn_now_naive()
     app = current_app._get_current_object()
     max_hours = float(current_app.config["CRAWL_MAX_HOURS"])
     max_fans = int(current_app.config["CRAWL_MAX_FANS"])
@@ -659,7 +660,7 @@ def run_crawl_job():
 
 
 def cleanup_expired_articles():
-    expire_before = datetime.utcnow() - timedelta(hours=24)
+    expire_before = cn_now_naive() - timedelta(hours=24)
     deleted = (
         Article.query.filter(
             ((Article.published_at.isnot(None)) & (Article.published_at < expire_before))

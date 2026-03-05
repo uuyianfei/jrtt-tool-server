@@ -1,8 +1,7 @@
-from datetime import datetime
-
 from sqlalchemy import JSON
 
 from .extensions import db
+from .time_utils import cn_now_naive
 
 
 class Article(db.Model):
@@ -27,14 +26,14 @@ class Article(db.Model):
     comment_count = db.Column(db.Integer, nullable=False, default=0, index=True)
 
     source_html = db.Column(db.Text, nullable=False, default="")
-    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow, index=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=cn_now_naive, index=True)
     updated_at = db.Column(
         db.DateTime,
         nullable=False,
-        default=datetime.utcnow,
-        onupdate=datetime.utcnow,
+        default=cn_now_naive,
+        onupdate=cn_now_naive,
     )
-    last_seen_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow, index=True)
+    last_seen_at = db.Column(db.DateTime, nullable=False, default=cn_now_naive, index=True)
 
 
 class RewriteTask(db.Model):
@@ -55,11 +54,11 @@ class RewriteTask(db.Model):
     suggested_titles = db.Column(JSON, nullable=True)
     error_message = db.Column(db.Text, nullable=True)
 
-    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    created_at = db.Column(db.DateTime, nullable=False, default=cn_now_naive)
     updated_at = db.Column(
         db.DateTime,
         nullable=False,
-        default=datetime.utcnow,
-        onupdate=datetime.utcnow,
+        default=cn_now_naive,
+        onupdate=cn_now_naive,
     )
     completed_at = db.Column(db.DateTime, nullable=True)

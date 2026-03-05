@@ -8,6 +8,7 @@ services:
     env_file:
       - .env
     environment:
+      TZ: ${TZ:-Asia/Shanghai}
       # 容器内 Selenium 路径默认值；如 .env 已设置则以 .env 为准
       CHROMEDRIVER_PATH: ${CHROMEDRIVER_PATH:-/usr/bin/chromedriver}
       CHROME_BINARY_PATH: ${CHROME_BINARY_PATH:-/usr/bin/chromium}

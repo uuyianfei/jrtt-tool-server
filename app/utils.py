@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 
 from flask import jsonify
 
+from .time_utils import cn_now_naive
 
 def success_response(data=None, message="ok"):
     if data is None:
@@ -48,7 +49,7 @@ def parse_hours_ago(time_str: str):
     if not time_str or time_str == "未知时间":
         return None
     text = time_str.strip()
-    now = datetime.now()
+    now = cn_now_naive()
     try:
         if "小时前" in text:
             m = re.search(r"(\d+)\s*小时前", text)

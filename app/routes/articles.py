@@ -1,8 +1,7 @@
-from datetime import datetime
-
 from flask import Blueprint, request
 
 from ..models import Article
+from ..time_utils import cn_now_naive
 from ..utils import error_response, format_compact_number, success_response
 
 articles_bp = Blueprint("articles", __name__)
@@ -64,7 +63,7 @@ def search_articles():
 
     total = q.count()
     rows = q.offset((page_no - 1) * page_size).limit(page_size).all()
-    now = datetime.utcnow()
+    now = cn_now_naive()
 
     items = []
     for row in rows:

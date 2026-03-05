@@ -1,7 +1,6 @@
 import threading
 import time
 import uuid
-from datetime import datetime
 
 import requests
 from bs4 import BeautifulSoup
@@ -9,10 +8,11 @@ from flask import current_app
 
 from .extensions import db
 from .models import Article, RewriteTask
+from .time_utils import cn_now_naive
 
 
 def new_task_id() -> str:
-    stamp = datetime.now().strftime("%Y%m%d%H%M%S")
+    stamp = cn_now_naive().strftime("%Y%m%d%H%M%S")
     suffix = uuid.uuid4().hex[:6]
     return f"task-{stamp}-{suffix}"
 
@@ -49,7 +49,7 @@ def _rewrite_worker(app, task_id: str):
             task.progress = 100
             task.status_text = "改写完成"
             task.time_remaining = 0
-            task.completed_at = datetime.utcnow()
+            task.completed_at = cn_now_naive()
             db.session.commit()
         except Exception as exc:
             task.error_message = str(exc)
