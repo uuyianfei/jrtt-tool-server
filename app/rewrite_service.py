@@ -1,3 +1,5 @@
+import json
+import re
 import threading
 import time
 import uuid
@@ -39,6 +41,7 @@ def _rewrite_worker(app, task_id: str):
             _update_task(task, 70, "AI 正在深度改写中...", 3)
 
             rewritten_html, suggested_titles = _rewrite_text(source_title, source_text)
+            rewritten_html = _inject_source_images(rewritten_html, source_html)
             time.sleep(1)
             _update_task(task, 95, "正在整理结果...", 1)
 
@@ -103,8 +106,10 @@ def _rewrite_text(original_title: str, source_text: str):
     api_key = current_app.config["DEEPSEEK_API_KEY"]
     if api_key:
         prompt = (
-            "请把下面文章改写成口语化、可读性强的中文内容，输出 HTML 段落格式。"
-            "另外返回 3 个标题建议。\n"
+            "请将下面文章改写成口语化、可读性强的中文内容。\n"
+            "严格只输出 JSON（不要 markdown 代码块）："
+            '{"rewrittenBodyHtml":"<p>...</p>","suggestedTitles":["标题1","标题2","标题3"]}\n'
+            "要求：rewrittenBodyHtml 只放正文，不要包含“标题建议”等段落。\n"
             f"原标题：{original_title}\n"
             f"原文：{source_text}"
         )
@@ -126,10 +131,7 @@ def _rewrite_text(original_title: str, source_text: str):
         )
         resp.raise_for_status()
         content = resp.json()["choices"][0]["message"]["content"].strip()
-        rewritten_html = "".join(
-            [f"<p>{line.strip()}</p>" for line in content.splitlines() if line.strip()][:20]
-        )
-        titles = [f"{original_title}-改写版1", f"{original_title}-改写版2", f"{original_title}-改写版3"]
+        rewritten_html, titles = _parse_ai_result(content, original_title)
         return rewritten_html, titles
 
     # 无 AI Key 时给出可联调的兜底结果
@@ -143,3 +145,160 @@ def _rewrite_text(original_title: str, source_text: str):
         f"{original_title}：一个更好理解的版本",
     ]
     return rewritten_html, titles
+
+
+def _parse_ai_result(content: str, original_title: str):
+    # 1) 优先按 JSON 解析
+    for candidate in [content, _extract_json_block(content)]:
+        if not candidate:
+            continue
+        try:
+            data = json.loads(candidate)
+            if isinstance(data, dict):
+                html = str(data.get("rewrittenBodyHtml") or "").strip()
+                titles = data.get("suggestedTitles") or []
+                if not html:
+                    continue
+                return _normalize_html(html), _normalize_titles(titles, original_title)
+        except Exception:
+            pass
+
+    # 2) 回退：按文本拆分
+    lines = [line.strip() for line in content.splitlines() if line.strip()]
+    titles = _extract_titles_from_text(lines)
+    body_lines = [ln for ln in lines if not _is_title_line(ln)]
+    html = "".join([f"<p>{ln}</p>" for ln in body_lines[:30]]) or "<p>暂无改写内容</p>"
+    return _normalize_html(html), _normalize_titles(titles, original_title)
+
+
+def _extract_json_block(text: str):
+    m = re.search(r"\{[\s\S]*\}", text)
+    return m.group(0) if m else ""
+
+
+def _extract_titles_from_text(lines):
+    titles = []
+    for ln in lines:
+        cleaned = re.sub(r"^[\-\d\.\)、\s]+", "", ln).strip()
+        if len(cleaned) < 6:
+            continue
+        if any(k in cleaned for k in ["标题建议", "推荐标题", "备选标题"]):
+            continue
+        if cleaned not in titles:
+            titles.append(cleaned)
+        if len(titles) >= 3:
+            break
+    return titles
+
+
+def _is_title_line(line: str) -> bool:
+    return bool(re.search(r"(标题建议|推荐标题|备选标题|^第?\d+[\.、\)]?)", line))
+
+
+def _normalize_titles(titles, original_title: str):
+    normalized = []
+    for t in (titles or []):
+        text = str(t).strip()
+        text = re.sub(r"^[\-\d\.\)、\s]+", "", text)
+        if text and text not in normalized:
+            normalized.append(text)
+        if len(normalized) >= 3:
+            break
+    if len(normalized) < 3:
+        fallback = [
+            f"{original_title}：换个角度看真相",
+            f"{original_title}：3个最值得关注的点",
+            f"{original_title}：事情背后没那么简单",
+        ]
+        for t in fallback:
+            if t not in normalized:
+                normalized.append(t)
+            if len(normalized) >= 3:
+                break
+    return normalized[:3]
+
+
+def _normalize_html(html: str):
+    text = (html or "").strip()
+    if "<p" in text or "<div" in text or "<article" in text:
+        return text
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    return "".join([f"<p>{ln}</p>" for ln in lines]) or "<p>暂无改写内容</p>"
+
+
+def _inject_source_images(rewritten_html: str, source_html: str):
+    if not source_html:
+        return rewritten_html
+    rewritten = BeautifulSoup(rewritten_html or "", "html.parser")
+    source = BeautifulSoup(source_html, "html.parser")
+
+    img_points, source_para_total = _extract_source_image_points(source)
+    if not img_points:
+        return str(rewritten)
+
+    # 不使用 AI 返回的图片，统一替换为原文图片
+    for img in rewritten.find_all("img"):
+        img.decompose()
+
+    rewritten_paras = rewritten.find_all("p")
+    rewritten_para_total = len(rewritten_paras)
+
+    if rewritten_para_total == 0:
+        for _, src in img_points:
+            p = rewritten.new_tag("p")
+            p.append(rewritten.new_tag("img", src=src))
+            rewritten.append(p)
+        return str(rewritten)
+
+    inserted_after_index = -1
+    for source_para_index, src in img_points:
+        if source_para_total <= 0:
+            target_index = rewritten_para_total - 1
+        else:
+            # 按原文段落相对位置映射到改写段落位置
+            ratio = min(1.0, max(0.0, source_para_index / float(source_para_total)))
+            target_index = int(round(ratio * (rewritten_para_total - 1)))
+        target_index = max(target_index, inserted_after_index)
+        target_index = min(target_index, rewritten_para_total - 1)
+
+        target_p = rewritten_paras[target_index]
+        img_p = rewritten.new_tag("p")
+        img_p.append(rewritten.new_tag("img", src=src))
+        target_p.insert_after(img_p)
+        inserted_after_index = target_index
+    return str(rewritten)
+
+
+def _extract_source_image_points(source_soup: BeautifulSoup):
+    """
+    返回 [(source_para_index, img_src), ...]。
+    source_para_index 表示该图片在原文第几个段落之后出现（相对位置映射用）。
+    """
+    container = source_soup.select_one("article") or source_soup.body or source_soup
+    para_idx = 0
+    img_points = []
+    seen = set()
+
+    for node in container.descendants:
+        if getattr(node, "name", None) in {"p", "h1", "h2", "h3", "h4"}:
+            text = node.get_text(strip=True)
+            if text:
+                para_idx += 1
+        if getattr(node, "name", None) == "img":
+            src = (
+                node.get("src")
+                or node.get("data-src")
+                or node.get("data-original")
+                or node.get("original-src")
+                or ""
+            ).strip()
+            if not src:
+                continue
+            if src.startswith("//"):
+                src = f"https:{src}"
+            if src in seen:
+                continue
+            seen.add(src)
+            img_points.append((para_idx, src))
+
+    return img_points, max(para_idx, 1)
