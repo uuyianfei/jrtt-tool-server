@@ -61,14 +61,18 @@ python run.py
 docker compose up -d --build
 ```
 
-说明：当前 `docker-compose.yml` 只启动 `app` 服务，MySQL 使用外部云数据库。
+说明：当前 `docker-compose.yml` 启动两个服务：
+- `api`：仅提供接口，不跑定时爬虫任务
+- `crawler`：仅负责定时爬虫与清理任务
+MySQL 使用外部云数据库。
 `docker compose` 会自动读取项目根目录 `.env`，请先把
 `MYSQL_HOST/MYSQL_PORT/MYSQL_USER/MYSQL_PASSWORD/MYSQL_DB` 配成你的云数据库信息。
 
 ### 查看日志
 
 ```bash
-docker compose logs -f app
+docker compose logs -f api
+docker compose logs -f crawler
 ```
 
 ### 停止并清理

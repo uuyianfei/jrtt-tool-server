@@ -1,5 +1,5 @@
 services:
-  app:
+  api:
     build:
       context: .
       dockerfile: Dockerfile
@@ -9,8 +9,26 @@ services:
       - .env
     environment:
       TZ: ${TZ:-Asia/Shanghai}
+      CRAWL_JOB_ENABLED: "false"
+      CLEANUP_JOB_ENABLED: "false"
       # 容器内 Selenium 路径默认值；如 .env 已设置则以 .env 为准
       CHROMEDRIVER_PATH: ${CHROMEDRIVER_PATH:-/usr/bin/chromedriver}
       CHROME_BINARY_PATH: ${CHROME_BINARY_PATH:-/usr/bin/chromium}
     ports:
       - "5000:5000"
+
+  crawler:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: jrtt-crawler
+    restart: unless-stopped
+    command: ["python", "run_crawler.py"]
+    env_file:
+      - .env
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      CRAWL_JOB_ENABLED: "true"
+      CLEANUP_JOB_ENABLED: "true"
+      CHROMEDRIVER_PATH: ${CHROMEDRIVER_PATH:-/usr/bin/chromedriver}
+      CHROME_BINARY_PATH: ${CHROME_BINARY_PATH:-/usr/bin/chromium}
