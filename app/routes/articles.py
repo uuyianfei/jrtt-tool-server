@@ -1,4 +1,8 @@
+from io import BytesIO
+
 from flask import Blueprint, request
+from flask import send_file
+from openpyxl import Workbook
 
 from ..models import Article
 from ..time_utils import cn_now_naive
@@ -23,22 +27,15 @@ def _apply_numeric_filter(query, column, cfg):
     return query
 
 
-@articles_bp.post("/articles/search")
-def search_articles():
-    body = request.get_json(silent=True) or {}
-
-    page_no = int(body.get("pageNo", 1))
-    page_size = int(body.get("pageSize", 6))
+def _build_filtered_query(body):
     sort_field = body.get("sortField", "time")
     sort_order = body.get("sortOrder", "desc")
     max_hours = body.get("maxPublishedHours")
 
-    if page_no < 1 or page_size < 1:
-        return error_response(4001, "分页参数无效")
     if sort_field not in {"followers", "views", "time"}:
-        return error_response(4001, "sortField 仅支持 followers|views|time")
+        return None, error_response(4001, "sortField 仅支持 followers|views|time")
     if sort_order not in {"asc", "desc"}:
-        return error_response(4001, "sortOrder 仅支持 asc|desc")
+        return None, error_response(4001, "sortOrder 仅支持 asc|desc")
 
     q = Article.query.filter(Article.published_hours_ago <= 24)
     if max_hours is not None:
@@ -46,7 +43,7 @@ def search_articles():
             max_hours = float(max_hours)
             q = q.filter(Article.published_hours_ago <= max_hours)
         except ValueError:
-            return error_response(4001, "maxPublishedHours 参数无效")
+            return None, error_response(4001, "maxPublishedHours 参数无效")
 
     q = _apply_numeric_filter(q, Article.followers, body.get("followerFilter"))
     q = _apply_numeric_filter(q, Article.view_count, body.get("viewFilter"))
@@ -60,6 +57,21 @@ def search_articles():
     else:
         sort_col = Article.published_at
     q = q.order_by(sort_col.asc() if sort_order == "asc" else sort_col.desc())
+    return q, None
+
+
+@articles_bp.post("/articles/search")
+def search_articles():
+    body = request.get_json(silent=True) or {}
+
+    page_no = int(body.get("pageNo", 1))
+    page_size = int(body.get("pageSize", 6))
+
+    if page_no < 1 or page_size < 1:
+        return error_response(4001, "分页参数无效")
+    q, err_resp = _build_filtered_query(body)
+    if err_resp:
+        return err_resp
 
     total = q.count()
     rows = q.offset((page_no - 1) * page_size).limit(page_size).all()
@@ -98,3 +110,66 @@ def search_articles():
         "hasMore": page_no * page_size < total,
     }
     return success_response(data)
+
+
+@articles_bp.post("/articles/export")
+def export_articles():
+    body = request.get_json(silent=True) or {}
+    q, err_resp = _build_filtered_query(body)
+    if err_resp:
+        return err_resp
+
+    rows = q.all()
+    now = cn_now_naive()
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "articles"
+    ws.append(
+        [
+            "文章ID",
+            "标题",
+            "链接",
+            "作者",
+            "粉丝数",
+            "阅读数",
+            "点赞数",
+            "评论数",
+            "发布时间文本",
+            "发布时间(小时前)",
+            "封面",
+            "原文HTML",
+        ]
+    )
+
+    for row in rows:
+        hours_ago = row.published_hours_ago
+        if row.published_at:
+            hours_ago = max(0, (now - row.published_at).total_seconds() / 3600)
+        ws.append(
+            [
+                row.article_id or f"a-{row.id}",
+                row.title or "",
+                row.url or "",
+                row.author or "",
+                int(row.followers or 0),
+                int(row.view_count or 0),
+                int(row.like_count or 0),
+                int(row.comment_count or 0),
+                row.publish_time_text or "",
+                round(float(hours_ago or 0), 2),
+                row.cover or "",
+                row.source_html or "",
+            ]
+        )
+
+    output = BytesIO()
+    wb.save(output)
+    output.seek(0)
+    filename = f"articles_export_{now.strftime('%Y%m%d_%H%M%S')}.xlsx"
+    return send_file(
+        output,
+        as_attachment=True,
+        download_name=filename,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )

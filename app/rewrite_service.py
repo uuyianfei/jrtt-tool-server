@@ -8,6 +8,7 @@ import requests
 from bs4 import BeautifulSoup
 from flask import current_app
 
+from .crawler import ToutiaoCrawler
 from .extensions import db
 from .models import Article, RewriteTask
 from .time_utils import cn_now_naive
@@ -74,26 +75,29 @@ def _fetch_source(url: str):
     if article and article.source_html:
         title = article.title or "原标题"
         html = _sanitize_image_inline_styles(article.source_html)
-        return html, title, _html_to_text(html)
+        text = _html_to_text(html)
+        _ensure_valid_source_content(url, html, text)
+        return html, title, text
 
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        )
-    }
-    resp = requests.get(url, timeout=20, headers=headers)
-    resp.raise_for_status()
-    soup = BeautifulSoup(resp.text, "html.parser")
-    container = soup.select_one("article") or soup.select_one(".syl-article-base") or soup.body
-    html = _sanitize_image_inline_styles(str(container) if container else "")
-    title = ""
-    if soup.title and soup.title.string:
-        title = soup.title.string.strip()
-    if not title:
+    # 未命中数据库时，改为使用 Selenium 爬虫抓取原文（与爬虫 job 同源）
+    crawler = ToutiaoCrawler(headless=current_app.config.get("CRAWL_HEADLESS", True))
+    try:
+        details = crawler._get_article_details(url)
+    finally:
+        crawler.close()
+
+    html = _sanitize_image_inline_styles(details.get("article_html") or "")
+    title = (details.get("title") or "").strip()
+    if not title and html:
+        soup = BeautifulSoup(html, "html.parser")
         h1 = soup.select_one("h1")
-        title = h1.get_text(strip=True) if h1 else "原标题"
-    return html, title, _html_to_text(html)
+        title = h1.get_text(strip=True) if h1 else ""
+    if not title:
+        title = "原标题"
+
+    text = _html_to_text(html)
+    _ensure_valid_source_content(url, html, text)
+    return html, title, text
 
 
 def _html_to_text(html: str) -> str:
@@ -102,6 +106,24 @@ def _html_to_text(html: str) -> str:
     if texts:
         return "\n".join(texts)
     return soup.get_text("\n", strip=True)
+
+
+def _ensure_valid_source_content(url: str, html: str, text: str):
+    """
+    严格校验原文是否有效，避免“无正文链接”被 AI 凭空改写。
+    """
+    normalized_url = (url or "").strip()
+    # 头条文章链接通常包含 /article/{id}/
+    looks_like_article_url = bool(re.search(r"/article/\d+/?", normalized_url))
+    has_article_container = bool(
+        re.search(r'class=["\'][^"\']*(syl-article-base|tt-article-content)[^"\']*["\']', html or "")
+        or re.search(r"<article\b", html or "", flags=re.IGNORECASE)
+    )
+    text_len = len((text or "").strip())
+
+    # 非文章链接或正文过短都判为无效，阻止进入改写
+    if (not looks_like_article_url) or (not has_article_container) or text_len < 120:
+        raise ValueError("未能抓取到有效原文内容，请检查文章链接是否正确")
 
 
 def _rewrite_text(original_title: str, source_text: str, source_html: str):
@@ -172,10 +194,17 @@ def _parse_ai_result(content: str, original_title: str):
         except Exception:
             pass
 
+    # 1.5) 兼容“半 JSON / 转义 JSON”文本
+    recovered_html = _extract_rewritten_body_from_text(content)
+    recovered_titles = _extract_suggested_titles_from_text(content)
+    if recovered_html:
+        return _normalize_html(recovered_html), _normalize_titles(recovered_titles, original_title)
+
     # 2) 回退：按文本拆分
     lines = [line.strip() for line in content.splitlines() if line.strip()]
     titles = _extract_titles_from_text(lines)
     body_lines = [ln for ln in lines if not _is_title_line(ln)]
+    body_lines = [ln for ln in body_lines if not _looks_like_json_fragment(ln)]
     html = "".join([f"<p>{ln}</p>" for ln in body_lines[:30]]) or "<p>暂无改写内容</p>"
     return _normalize_html(html), _normalize_titles(titles, original_title)
 
@@ -188,6 +217,8 @@ def _extract_json_block(text: str):
 def _extract_titles_from_text(lines):
     titles = []
     for ln in lines:
+        if _looks_like_json_fragment(ln):
+            continue
         cleaned = re.sub(r"^[\-\d\.\)、\s]+", "", ln).strip()
         if len(cleaned) < 6:
             continue
@@ -209,6 +240,8 @@ def _normalize_titles(titles, original_title: str):
     for t in (titles or []):
         text = str(t).strip()
         text = re.sub(r"^[\-\d\.\)、\s]+", "", text)
+        if _looks_like_json_fragment(text):
+            continue
         if text and text not in normalized:
             normalized.append(text)
         if len(normalized) >= 3:
@@ -229,10 +262,62 @@ def _normalize_titles(titles, original_title: str):
 
 def _normalize_html(html: str):
     text = (html or "").strip()
+    recovered = _extract_rewritten_body_from_text(text)
+    if recovered:
+        text = recovered.strip()
     if "<p" in text or "<div" in text or "<article" in text:
         return text
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     return "".join([f"<p>{ln}</p>" for ln in lines]) or "<p>暂无改写内容</p>"
+
+
+def _extract_rewritten_body_from_text(text: str) -> str:
+    if not text:
+        return ""
+    # 先尝试键值对解析，兼容 value 是转义字符串
+    m = re.search(r'"rewrittenBodyHtml"\s*:\s*"((?:\\.|[^"\\])*)"', text, flags=re.DOTALL)
+    if m:
+        raw = m.group(1)
+        try:
+            return json.loads(f'"{raw}"')
+        except Exception:
+            return (
+                raw.replace('\\"', '"')
+                .replace("\\n", "\n")
+                .replace("\\t", "\t")
+                .replace("\\/", "/")
+            )
+    # 再尝试非引号值（少见）
+    m = re.search(r'"rewrittenBodyHtml"\s*:\s*(\{[\s\S]*\}|<[\s\S]*>)', text, flags=re.DOTALL)
+    if m:
+        return m.group(1).strip()
+    return ""
+
+
+def _extract_suggested_titles_from_text(text: str):
+    if not text:
+        return []
+    m = re.search(r'"suggestedTitles"\s*:\s*(\[[\s\S]*?\])', text, flags=re.DOTALL)
+    if m:
+        arr_text = m.group(1)
+        try:
+            data = json.loads(arr_text)
+            if isinstance(data, list):
+                return [str(x) for x in data]
+        except Exception:
+            pass
+    return []
+
+
+def _looks_like_json_fragment(text: str) -> bool:
+    t = (text or "").strip()
+    if not t:
+        return True
+    if any(k in t for k in ['"rewrittenBodyHtml"', '"suggestedTitles"', '{"', '}', '":']):
+        return True
+    if "<p>" in t and len(t) > 80:
+        return True
+    return False
 
 
 def _build_image_guidance(source_html: str) -> str:

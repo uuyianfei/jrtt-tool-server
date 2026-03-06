@@ -16,6 +16,8 @@ class AppScheduler:
     def init_app(self, app):
         crawl_seconds = app.config["CRAWL_INTERVAL_SECONDS"]
         cleanup_minutes = app.config["CLEANUP_INTERVAL_MINUTES"]
+        crawl_enabled = bool(app.config.get("CRAWL_JOB_ENABLED", True))
+        cleanup_enabled = bool(app.config.get("CLEANUP_JOB_ENABLED", True))
 
         def crawl_wrapper():
             with app.app_context():
@@ -31,24 +33,31 @@ class AppScheduler:
                 except Exception as exc:
                     logger.exception("cleanup job error: %s", exc)
 
-        self.scheduler.add_job(
-            crawl_wrapper,
-            trigger="interval",
-            seconds=crawl_seconds,
-            id="crawl_job",
-            replace_existing=True,
-            max_instances=1,
-            next_run_time=datetime.now(),
-        )
-        self.scheduler.add_job(
-            cleanup_wrapper,
-            trigger="interval",
-            minutes=cleanup_minutes,
-            id="cleanup_job",
-            replace_existing=True,
-            max_instances=1,
-            next_run_time=datetime.now(),
-        )
+        if crawl_enabled:
+            self.scheduler.add_job(
+                crawl_wrapper,
+                trigger="interval",
+                seconds=crawl_seconds,
+                id="crawl_job",
+                replace_existing=True,
+                max_instances=1,
+                next_run_time=datetime.now(),
+            )
+        else:
+            logger.info("crawl job disabled by CRAWL_JOB_ENABLED=false")
+
+        if cleanup_enabled:
+            self.scheduler.add_job(
+                cleanup_wrapper,
+                trigger="interval",
+                minutes=cleanup_minutes,
+                id="cleanup_job",
+                replace_existing=True,
+                max_instances=1,
+                next_run_time=datetime.now(),
+            )
+        else:
+            logger.info("cleanup job disabled by CLEANUP_JOB_ENABLED=false")
 
     def start(self):
         if not self.started:

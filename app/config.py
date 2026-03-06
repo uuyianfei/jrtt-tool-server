@@ -25,6 +25,8 @@ class Config:
 
     CRAWL_INTERVAL_SECONDS = int(os.getenv("CRAWL_INTERVAL_SECONDS", "120"))
     CLEANUP_INTERVAL_MINUTES = int(os.getenv("CLEANUP_INTERVAL_MINUTES", "30"))
+    CRAWL_JOB_ENABLED = os.getenv("CRAWL_JOB_ENABLED", "true").lower() == "true"
+    CLEANUP_JOB_ENABLED = os.getenv("CLEANUP_JOB_ENABLED", "true").lower() == "true"
     CRAWL_TARGET_COUNT = int(os.getenv("CRAWL_TARGET_COUNT", "20"))
     CRAWL_LIST_SCROLL_ROUNDS = int(os.getenv("CRAWL_LIST_SCROLL_ROUNDS", "6"))
     CRAWL_DETAIL_WORKERS = int(os.getenv("CRAWL_DETAIL_WORKERS", "3"))
