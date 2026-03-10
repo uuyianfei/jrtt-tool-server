@@ -2,6 +2,8 @@ import logging
 import os
 import re
 import time
+import json
+import html
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -13,7 +15,6 @@ from flask import current_app
 from selenium import webdriver
 from selenium.common.exceptions import InvalidSessionIdException, TimeoutException, WebDriverException
 from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from sqlalchemy import or_
 from sqlalchemy.exc import SQLAlchemyError
@@ -85,6 +86,16 @@ def normalize_article_url(url: str) -> str:
     if m:
         path = f"/article/{m.group(1)}/"
     return urlunsplit((scheme, netloc, path, "", ""))
+
+
+def sanitize_article_url_for_storage(url: str) -> str:
+    clean = normalize_article_url(url)
+    if not clean:
+        return ""
+    # 存储层最终保护：非标准 article 链接不入库
+    if not re.search(r"/article/\d+/?$", clean):
+        return ""
+    return clean
 
 
 def acquire_author_leases(limit: int) -> List[AuthorSource]:
@@ -414,9 +425,17 @@ class ToutiaoCrawler:
         selectors = [
             "article.syl-article-base",
             ".syl-article-base",
+            ".syl-page-article",
+            ".article-main",
+            ".article-content-wrap",
             ".article-content",
             ".a-con",
             ".tt-article-content",
+            ".tt-post-content",
+            ".pgc-article",
+            ".wtt-content",
+            ".wtt-details-content",
+            "[data-testid='article-content']",
             ".content",
             "article",
         ]
@@ -425,6 +444,77 @@ class ToutiaoCrawler:
             if node:
                 return node
         return None
+
+    def _is_meaningful_article_html(self, article_html: str) -> bool:
+        if not article_html:
+            return False
+        text = BeautifulSoup(article_html, "html.parser").get_text(" ", strip=True)
+        return len(text) >= 80
+
+    def _wait_article_ready(self, timeout_seconds: int = 6):
+        selectors = [
+            "article.syl-article-base",
+            ".syl-article-base",
+            ".syl-page-article",
+            ".article-main",
+            ".article-content-wrap",
+            ".article-content",
+            ".a-con",
+            ".tt-article-content",
+            ".tt-post-content",
+            ".pgc-article",
+            "article",
+        ]
+        selector_js = ",".join([f'"{s}"' for s in selectors])
+        js = f"""
+        const selectors = [{selector_js}];
+        for (const s of selectors) {{
+          const el = document.querySelector(s);
+          if (!el) continue;
+          const t = (el.innerText || "").trim();
+          if (t.length >= 80) return true;
+        }}
+        return false;
+        """
+        WebDriverWait(self.driver, timeout_seconds).until(lambda d: bool(d.execute_script(js)))
+
+    def _extract_article_html_from_scripts(self, soup: BeautifulSoup, html_text: str) -> str:
+        # JSON-LD 正文
+        for script in soup.find_all("script", attrs={"type": "application/ld+json"}):
+            text = (script.string or script.get_text() or "").strip()
+            if not text:
+                continue
+            try:
+                data = json.loads(text)
+            except Exception:
+                continue
+            blocks = data if isinstance(data, list) else [data]
+            for block in blocks:
+                if not isinstance(block, dict):
+                    continue
+                body = block.get("articleBody")
+                if isinstance(body, str) and len(body.strip()) >= 50:
+                    content = html.escape(body.strip()).replace("\n", "</p><p>")
+                    return f"<article><p>{content}</p></article>"
+
+        # 兜底：脚本中的 content/articleBody/body 字段
+        patterns = [
+            r'"articleBody"\s*:\s*"(.{80,}?)"',
+            r'"content"\s*:\s*"(.{80,}?)"',
+            r'"body"\s*:\s*"(.{80,}?)"',
+        ]
+        for pattern in patterns:
+            m = re.search(pattern, html_text, re.IGNORECASE | re.DOTALL)
+            if not m:
+                continue
+            raw = m.group(1)
+            cleaned = raw.encode("utf-8", "ignore").decode("unicode_escape", errors="ignore")
+            cleaned = cleaned.replace("\\n", "\n").replace("\\t", " ").strip()
+            cleaned = re.sub(r"<[^>]+>", "", cleaned)
+            if len(cleaned) >= 80:
+                content = html.escape(cleaned).replace("\n", "</p><p>")
+                return f"<article><p>{content}</p></article>"
+        return ""
 
     def _get_article_details(self, article_url: str) -> Dict:
         detail = {
@@ -439,18 +529,8 @@ class ToutiaoCrawler:
             article_url = normalize_article_url(article_url)
             self._safe_get(article_url)
             self._safe_execute_script("window.scrollTo(0, 0);")
-            selectors = [
-                "article.syl-article-base",
-                ".syl-article-base",
-                ".article-content",
-                ".a-con",
-                ".tt-article-content",
-                "article",
-            ]
             try:
-                WebDriverWait(self.driver, 5).until(
-                    lambda d: any(d.find_elements(By.CSS_SELECTOR, s) for s in selectors)
-                )
+                self._wait_article_ready(timeout_seconds=6)
             except TimeoutException:
                 # 页面结构不稳定时继续走兜底解析，不中断流程
                 time.sleep(1.0)
@@ -508,7 +588,33 @@ class ToutiaoCrawler:
             if container:
                 detail["article_html"] = str(container)
             else:
-                logger.info("empty article html extracted url=%s", article_url)
+                fallback_html = self._extract_article_html_from_scripts(soup, html)
+                if fallback_html:
+                    detail["article_html"] = fallback_html
+                    logger.info("article html extracted via script fallback url=%s", article_url)
+                else:
+                    logger.info("empty article html extracted url=%s", article_url)
+
+            # 二次兜底：首轮正文为空或正文过短时，等待并重抓一次
+            if not self._is_meaningful_article_html(detail.get("article_html", "")):
+                try:
+                    self._safe_execute_script("window.scrollTo(0, 0);")
+                    self._wait_article_ready(timeout_seconds=5)
+                except Exception:
+                    time.sleep(0.8)
+                html_retry = self._safe_page_source()
+                soup_retry = BeautifulSoup(html_retry, "html.parser")
+                container_retry = self._extract_article_container(soup_retry)
+                if container_retry:
+                    retry_html = str(container_retry)
+                    if self._is_meaningful_article_html(retry_html):
+                        detail["article_html"] = retry_html
+                        logger.info("article html extracted via retry url=%s", article_url)
+                if not self._is_meaningful_article_html(detail.get("article_html", "")):
+                    fallback_retry = self._extract_article_html_from_scripts(soup_retry, html_retry)
+                    if fallback_retry:
+                        detail["article_html"] = fallback_retry
+                        logger.info("article html extracted via retry script fallback url=%s", article_url)
 
             title_elem = soup.select_one("h1") or soup.select_one("title")
             if title_elem:
@@ -875,7 +981,11 @@ def upsert_articles(items: List[Dict], max_hours: Optional[float] = None):
             fans = int(item["fans"])
             details = item["details"]
             read_count = int(item["read_count"])
-            base["url"] = normalize_article_url(base.get("url", ""))
+            base["url"] = sanitize_article_url_for_storage(base.get("url", ""))
+            if not base["url"]:
+                stats["errors"] += 1
+                logger.warning("skip article_id=%s reason=invalid_storage_url", article_id)
+                continue
             published_at = item.get("published_at") or (now - timedelta(hours=hours_ago))
             url_hash = sha256_hex(base["url"])
             article = Article.query.filter(
@@ -897,6 +1007,7 @@ def upsert_articles(items: List[Dict], max_hours: Optional[float] = None):
                 stats["updated"] += 1
 
             article.title = details.get("title") or base.get("title") or "无标题"
+            article.url = base["url"]
             article.url_hash = url_hash
             article.cover = base.get("cover", "")
             article.author = base.get("author", "")
