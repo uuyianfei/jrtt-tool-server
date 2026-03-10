@@ -62,3 +62,30 @@ class RewriteTask(db.Model):
         onupdate=cn_now_naive,
     )
     completed_at = db.Column(db.DateTime, nullable=True)
+
+
+class AuthorSource(db.Model):
+    __tablename__ = "author_sources"
+
+    id = db.Column(db.Integer, primary_key=True)
+    # MySQL utf8mb4 indexed varchar length must keep within index byte limit.
+    author_url = db.Column(db.String(512), unique=True, nullable=False, index=True)
+    author_name = db.Column(db.String(128), nullable=False, default="")
+    followers = db.Column(db.Integer, nullable=False, default=0, index=True)
+    status = db.Column(db.String(32), nullable=False, default="active", index=True)
+    lease_owner = db.Column(db.String(128), nullable=False, default="", index=True)
+    lease_until = db.Column(db.DateTime, nullable=True, index=True)
+    fail_count = db.Column(db.Integer, nullable=False, default=0)
+    last_error = db.Column(db.String(512), nullable=False, default="")
+
+    first_seen_at = db.Column(db.DateTime, nullable=False, default=cn_now_naive, index=True)
+    last_seen_at = db.Column(db.DateTime, nullable=False, default=cn_now_naive, index=True)
+    last_crawled_at = db.Column(db.DateTime, nullable=True, index=True)
+
+    created_at = db.Column(db.DateTime, nullable=False, default=cn_now_naive, index=True)
+    updated_at = db.Column(
+        db.DateTime,
+        nullable=False,
+        default=cn_now_naive,
+        onupdate=cn_now_naive,
+    )

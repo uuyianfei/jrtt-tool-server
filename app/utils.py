@@ -1,10 +1,10 @@
-import re
 import hashlib
+import re
 from datetime import datetime, timedelta
 
 from flask import jsonify
 
-from .time_utils import cn_now_naive
+from .time_utils import SHANGHAI_TZ, cn_now_naive
 
 def success_response(data=None, message="ok"):
     if data is None:
@@ -82,4 +82,54 @@ def parse_hours_ago(time_str: str):
             return (now - dt).total_seconds() / 3600
     except Exception:
         return None
+    return None
+
+
+def parse_publish_datetime(time_text: str):
+    """Parse publish datetime text into naive datetime (Asia/Shanghai local clock)."""
+    if not time_text:
+        return None
+    raw = str(time_text).strip()
+    if not raw:
+        return None
+
+    # ISO8601: 2026-03-10T12:34:56+08:00 / 2026-03-10T04:34:56Z
+    iso_candidate = raw.replace("Z", "+00:00")
+    try:
+        if "T" in iso_candidate and ("+" in iso_candidate or iso_candidate.endswith("00:00")):
+            dt = datetime.fromisoformat(iso_candidate)
+            if dt.tzinfo is not None:
+                dt = dt.astimezone(SHANGHAI_TZ).replace(tzinfo=None)
+            return dt
+    except Exception:
+        pass
+
+    patterns = [
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y/%m/%d %H:%M:%S",
+        "%Y/%m/%d %H:%M",
+    ]
+    for fmt in patterns:
+        try:
+            return datetime.strptime(raw, fmt)
+        except ValueError:
+            continue
+
+    m = re.search(r"(\d{4})年(\d{1,2})月(\d{1,2})日\s*(\d{1,2}):(\d{1,2})(?::(\d{1,2}))?", raw)
+    if m:
+        year, month, day, hour, minute, second = m.groups()
+        return datetime(
+            int(year),
+            int(month),
+            int(day),
+            int(hour),
+            int(minute),
+            int(second or 0),
+        )
+
+    m = re.search(r"(\d{4})-(\d{1,2})-(\d{1,2})", raw)
+    if m:
+        year, month, day = m.groups()
+        return datetime(int(year), int(month), int(day))
     return None

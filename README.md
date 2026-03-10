@@ -61,9 +61,12 @@ python run.py
 docker compose up -d --build
 ```
 
-说明：当前 `docker-compose.yml` 启动两个服务：
+说明：当前 `docker-compose.yml` 启动三个服务：
 - `api`：仅提供接口，不跑定时爬虫任务
-- `crawler`：仅负责定时爬虫与清理任务
+- `author-collect`：仅负责推荐页作者采集与作者池更新
+- `author-articles`：仅负责作者文章抓取、文章入库与过期清理
+
+两条爬虫链路完全解耦，并通过作者租约锁避免重复抓同一作者。
 MySQL 使用外部云数据库。
 `docker compose` 会自动读取项目根目录 `.env`，请先把
 `MYSQL_HOST/MYSQL_PORT/MYSQL_USER/MYSQL_PASSWORD/MYSQL_DB` 配成你的云数据库信息。
@@ -72,7 +75,8 @@ MySQL 使用外部云数据库。
 
 ```bash
 docker compose logs -f api
-docker compose logs -f crawler
+docker compose logs -f author-collect
+docker compose logs -f author-articles
 ```
 
 ### 停止并清理
@@ -121,3 +125,40 @@ SSH 端口固定使用默认 `22`，无需配置 `SSH_PORT`。
 2. `git fetch` + `git reset --hard origin/<DEPLOY_BRANCH>`
 3. `docker compose down`
 4. `docker compose up -d --build`
+
+## 7. 吞吐与稳定性验收基线
+
+建议每次优化后固定观察 10 分钟窗口，按以下指标对比：
+
+- `每10分钟新增文章数`
+- `每10分钟处理作者数`
+- `锁冲突异常数（1205/1213）`
+- `PendingRollbackError 数`
+
+### 日志侧快速统计
+
+```bash
+docker compose logs --since=10m author-articles | grep -c "upsert success article_id="
+docker compose logs --since=10m author-articles | grep -c "author articles summary"
+docker compose logs --since=10m author-collect | grep -c "author collect summary"
+docker compose logs --since=10m author-articles | grep -E "1205|1213|PendingRollbackError"
+```
+
+### 数据库侧快速统计
+
+```sql
+-- 最近 10 分钟新增文章
+SELECT COUNT(*) AS new_articles_10m
+FROM articles
+WHERE created_at >= NOW() - INTERVAL 10 MINUTE;
+
+-- 最近 10 分钟被处理过的作者
+SELECT COUNT(*) AS processed_authors_10m
+FROM author_sources
+WHERE last_crawled_at >= NOW() - INTERVAL 10 MINUTE;
+
+-- 当前租约中作者（用于观测多实例是否在正常领取）
+SELECT COUNT(*) AS leased_authors_now
+FROM author_sources
+WHERE lease_until IS NOT NULL AND lease_until > NOW();
+```

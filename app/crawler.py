@@ -3,24 +3,109 @@ import os
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from bs4 import BeautifulSoup
 from flask import current_app
 from selenium import webdriver
 from selenium.common.exceptions import InvalidSessionIdException, WebDriverException
 from selenium.webdriver.chrome.service import Service
+from sqlalchemy import or_
+from sqlalchemy.exc import SQLAlchemyError
 from webdriver_manager.chrome import ChromeDriverManager
 
 from .extensions import db
-from .models import Article
-from .time_utils import cn_now_naive
-from .utils import parse_hours_ago, parse_number, sha256_hex
+from .models import Article, AuthorSource
+from .time_utils import SHANGHAI_TZ, cn_now_naive
+from .utils import parse_hours_ago, parse_number, parse_publish_datetime, sha256_hex
 
 
 logger = logging.getLogger(__name__)
+
+
+def _is_deadlock_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return "deadlock found" in text or "lock wait timeout exceeded" in text
+
+
+def _commit_with_retry(max_retries: int = 3, sleep_seconds: float = 0.3):
+    last_exc = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            db.session.commit()
+            return
+        except SQLAlchemyError as exc:
+            db.session.rollback()
+            last_exc = exc
+            if not _is_deadlock_error(exc) or attempt >= max_retries:
+                raise
+            delay = sleep_seconds * attempt
+            logger.warning("db commit deadlock retry=%s/%s sleep=%.2fs", attempt, max_retries, delay)
+            time.sleep(delay)
+    if last_exc:
+        raise last_exc
+
+
+def _chunked(items: List[Dict], n_chunks: int) -> List[List[Dict]]:
+    if not items:
+        return []
+    n_chunks = max(1, min(n_chunks, len(items)))
+    size = (len(items) + n_chunks - 1) // n_chunks
+    return [items[i : i + size] for i in range(0, len(items), size)]
+
+
+def _lease_owner_name() -> str:
+    raw = str(current_app.config.get("WORKER_ROLE") or "").strip()
+    if raw:
+        return raw
+    return f"worker-{os.getpid()}"
+
+
+def acquire_author_leases(limit: int) -> List[AuthorSource]:
+    if limit <= 0:
+        return []
+    now = cn_now_naive()
+    owner = _lease_owner_name()
+    lease_seconds = int(current_app.config.get("AUTHOR_LEASE_SECONDS", 240))
+    lease_until = now + timedelta(seconds=lease_seconds)
+
+    # 先多取一些候选，允许在竞争中部分领取失败
+    candidate_rows = (
+        AuthorSource.query.filter(
+            AuthorSource.status == "active",
+            or_(AuthorSource.lease_until.is_(None), AuthorSource.lease_until < now),
+        )
+        .order_by(AuthorSource.last_crawled_at.isnot(None), AuthorSource.last_crawled_at.asc(), AuthorSource.id.asc())
+        .limit(limit * 3)
+        .all()
+    )
+    leased_ids: List[int] = []
+    for row in candidate_rows:
+        updated = (
+            AuthorSource.query.filter(
+                AuthorSource.id == row.id,
+                AuthorSource.status == "active",
+                or_(AuthorSource.lease_until.is_(None), AuthorSource.lease_until < now),
+            )
+            .update(
+                {
+                    AuthorSource.lease_owner: owner,
+                    AuthorSource.lease_until: lease_until,
+                },
+                synchronize_session=False,
+            )
+        )
+        if updated == 1:
+            leased_ids.append(int(row.id))
+        if len(leased_ids) >= limit:
+            break
+    if leased_ids:
+        _commit_with_retry()
+        return AuthorSource.query.filter(AuthorSource.id.in_(leased_ids)).all()
+    db.session.rollback()
+    return []
 
 
 class ToutiaoCrawler:
@@ -306,6 +391,8 @@ class ToutiaoCrawler:
             "comment_count": 0,
             "article_html": "",
             "title": "",
+            "publish_time_text": "",
+            "published_at": None,
         }
         try:
             self._safe_get(article_url)
@@ -371,9 +458,67 @@ class ToutiaoCrawler:
             title_elem = soup.select_one("h1") or soup.select_one("title")
             if title_elem:
                 detail["title"] = title_elem.get_text(strip=True)[:200]
+            published_at, publish_text = self._extract_published_at_from_html(soup, html)
+            if published_at:
+                detail["published_at"] = published_at
+            if publish_text:
+                detail["publish_time_text"] = publish_text
         except Exception as exc:
             logger.warning("get detail failed: %s", exc)
         return detail
+
+    def _extract_published_at_from_html(self, soup: BeautifulSoup, html: str):
+        candidates = []
+        meta_selectors = [
+            ('meta[property="article:published_time"]', "content"),
+            ('meta[property="og:published_time"]', "content"),
+            ('meta[name="publish_time"]', "content"),
+            ('meta[name="publishdate"]', "content"),
+            ('meta[itemprop="datePublished"]', "content"),
+        ]
+        for selector, attr in meta_selectors:
+            node = soup.select_one(selector)
+            if node and node.get(attr):
+                candidates.append(node.get(attr, "").strip())
+
+        # JSON-LD / inline script 常见字段
+        string_patterns = [
+            r'"datePublished"\s*:\s*"([^"]+)"',
+            r'"publish_time"\s*:\s*"([^"]+)"',
+            r'"publishTime"\s*:\s*"([^"]+)"',
+            r'"published_at"\s*:\s*"([^"]+)"',
+        ]
+        for pattern in string_patterns:
+            m = re.search(pattern, html, re.IGNORECASE)
+            if m:
+                candidates.append((m.group(1) or "").strip())
+
+        for text in candidates:
+            dt = parse_publish_datetime(text)
+            if dt:
+                return dt, text
+
+        # 时间戳兜底（秒或毫秒）
+        ts_patterns = [
+            r'"publish_time"\s*:\s*(\d{10,13})',
+            r'"publishTime"\s*:\s*(\d{10,13})',
+            r'"create_time"\s*:\s*(\d{10,13})',
+            r'"created_time"\s*:\s*(\d{10,13})',
+        ]
+        for pattern in ts_patterns:
+            m = re.search(pattern, html, re.IGNORECASE)
+            if not m:
+                continue
+            raw = m.group(1)
+            try:
+                ts = int(raw)
+                if ts > 10**11:
+                    ts = ts // 1000
+                dt = datetime.fromtimestamp(ts, SHANGHAI_TZ).replace(tzinfo=None)
+                return dt, raw
+            except Exception:
+                continue
+        return None, ""
 
     def _get_article_read_count_from_author(
         self,
@@ -479,11 +624,68 @@ class ToutiaoCrawler:
         logger.warning("crawl recommend failed after retries")
         return []
 
+    def crawl_author_recent_articles(self, author_url: str, author_name: str = "", max_items: int = 30) -> List[Dict]:
+        if not author_url:
+            return []
+        scroll_rounds = int(current_app.config.get("AUTHOR_ARTICLE_SCROLL_ROUNDS", 4))
+        found_map = {}
+        self._safe_get(author_url)
+        time.sleep(1.2)
+        for _ in range(scroll_rounds):
+            html = self._safe_page_source()
+            soup = BeautifulSoup(html, "html.parser")
+            links = soup.find_all("a", href=True)
+            for link in links:
+                href = (link.get("href") or "").strip()
+                if "/article/" not in href:
+                    continue
+                article_url = href if href.startswith("http") else f"https://www.toutiao.com{href}"
+                m = re.search(r"/article/(\d+)/", article_url)
+                if not m:
+                    continue
+                article_id = m.group(1)
+                title = (link.get_text(strip=True) or link.get("title") or "").strip()
+                if not title:
+                    continue
+                publish_time = ""
+                parent = link
+                for _ in range(8):
+                    if parent is None:
+                        break
+                    text = parent.get_text(" ", strip=True)
+                    tm = re.search(
+                        r"(今天\s*\d{1,2}:\d{1,2}|昨天\s*\d{1,2}:\d{1,2}|\d+\s*小时前|\d+\s*分钟前|\d+\s*天前|"
+                        r"\d{1,2}月\d{1,2}日(?:\s*\d{1,2}:\d{1,2})?|"
+                        r"\d{4}[-/]\d{1,2}[-/]\d{1,2}\s*\d{1,2}:\d{1,2}(?::\d{1,2})?)",
+                        text,
+                    )
+                    if tm:
+                        publish_time = (tm.group(1) or "").strip()
+                        break
+                    parent = parent.parent
+                found_map[article_id] = {
+                    "article_id": article_id,
+                    "url": article_url,
+                    "title": title[:200],
+                    "author": author_name or "",
+                    "author_url": author_url,
+                    "publish_time": publish_time,
+                    "comment_count": 0,
+                    "cover": "",
+                }
+                if len(found_map) >= max_items:
+                    break
+            if len(found_map) >= max_items:
+                break
+            self._safe_execute_script("window.scrollTo(0, document.body.scrollHeight);")
+            time.sleep(1.0)
+        return list(found_map.values())[:max_items]
 
-def upsert_articles(items: List[Dict]):
+
+def upsert_articles(items: List[Dict], max_hours: Optional[float] = None):
     now = cn_now_naive()
     app = current_app._get_current_object()
-    max_hours = float(current_app.config["CRAWL_MAX_HOURS"])
+    max_hours = float(max_hours if max_hours is not None else current_app.config["CRAWL_MAX_HOURS"])
     max_fans = int(current_app.config["CRAWL_MAX_FANS"])
     detail_workers = max(1, int(current_app.config.get("CRAWL_DETAIL_WORKERS", 3)))
     crawl_headless = bool(current_app.config["CRAWL_HEADLESS"])
@@ -498,79 +700,108 @@ def upsert_articles(items: List[Dict]):
     }
     logger.info("detail workers=%s", detail_workers)
 
-    def enrich_one(base: Dict):
-        article_id = base.get("article_id", "")
-        title = (base.get("title") or "")[:40]
+    def enrich_chunk(chunk: List[Dict]) -> List[Dict]:
+        chunk_results: List[Dict] = []
         with app.app_context():
             crawler = ToutiaoCrawler(headless=crawl_headless)
             try:
-                logger.info("detail processing article_id=%s title=%s", article_id, title)
-                hours_ago = parse_hours_ago(base.get("publish_time", ""))
-                if hours_ago is None or hours_ago > max_hours:
-                    return {
-                        "status": "skip_time",
-                        "article_id": article_id,
-                        "hours_ago": hours_ago,
-                    }
+                for base in chunk:
+                    article_id = base.get("article_id", "")
+                    title = (base.get("title") or "")[:40]
+                    try:
+                        logger.info("detail processing article_id=%s title=%s", article_id, title)
+                        list_hours_ago = parse_hours_ago(base.get("publish_time", ""))
+                        fans = int(base.get("followers") or 0)
+                        if fans <= 0:
+                            fans = crawler._get_author_fans_count(base.get("author_url", ""))
+                        if fans >= max_fans:
+                            chunk_results.append(
+                                {"status": "skip_fans", "article_id": article_id, "fans": fans}
+                            )
+                            continue
 
-                fans = crawler._get_author_fans_count(base.get("author_url", ""))
-                if fans >= max_fans:
-                    return {
-                        "status": "skip_fans",
-                        "article_id": article_id,
-                        "fans": fans,
-                    }
-
-                details = crawler._get_article_details(base["url"])
-                read_count = crawler._get_article_read_count_from_author(
-                    author_url=base.get("author_url", ""),
-                    article_id=base.get("article_id", ""),
-                    article_title=base.get("title", ""),
-                    article_url=base.get("url", ""),
-                )
-                return {
-                    "status": "ok",
-                    "article_id": article_id,
-                    "base": base,
-                    "hours_ago": float(hours_ago),
-                    "fans": int(fans),
-                    "details": details,
-                    "read_count": int(read_count or 0),
-                }
+                        details = crawler._get_article_details(base["url"])
+                        detail_published_at = details.get("published_at")
+                        hours_ago = list_hours_ago
+                        if detail_published_at:
+                            hours_ago = max(0.0, (now - detail_published_at).total_seconds() / 3600)
+                        if hours_ago is None or hours_ago > max_hours:
+                            chunk_results.append(
+                                {
+                                    "status": "skip_time",
+                                    "article_id": article_id,
+                                    "hours_ago": hours_ago,
+                                }
+                            )
+                            continue
+                        read_count = crawler._get_article_read_count_from_author(
+                            author_url=base.get("author_url", ""),
+                            article_id=base.get("article_id", ""),
+                            article_title=base.get("title", ""),
+                            article_url=base.get("url", ""),
+                        )
+                        chunk_results.append(
+                            {
+                                "status": "ok",
+                                "article_id": article_id,
+                                "base": base,
+                                "hours_ago": float(hours_ago),
+                                "fans": int(fans),
+                                "details": details,
+                                "read_count": int(read_count or 0),
+                                "published_at": detail_published_at,
+                                "publish_time_text": details.get("publish_time_text")
+                                or base.get("publish_time", ""),
+                            }
+                        )
+                    except Exception as exc:
+                        chunk_results.append(
+                            {"status": "error", "article_id": article_id, "error": str(exc)[:300]}
+                        )
             finally:
                 crawler.close()
+        return chunk_results
 
     enrich_results = []
-    with ThreadPoolExecutor(max_workers=detail_workers) as executor:
-        future_map = {executor.submit(enrich_one, base): base for base in items}
+    chunks = _chunked(items, detail_workers)
+    with ThreadPoolExecutor(max_workers=max(1, len(chunks))) as executor:
+        future_map = {executor.submit(enrich_chunk, chunk): chunk for chunk in chunks}
         for future in as_completed(future_map):
-            base = future_map[future]
-            article_id = base.get("article_id", "")
             try:
-                result = future.result()
-                status = result.get("status")
-                if status == "skip_time":
-                    stats["skip_time"] += 1
-                    logger.info(
-                        "skip article_id=%s reason=time hours_ago=%s max_hours=%s",
-                        article_id,
-                        result.get("hours_ago"),
-                        max_hours,
-                    )
-                    continue
-                if status == "skip_fans":
-                    stats["skip_fans"] += 1
-                    logger.info(
-                        "skip article_id=%s reason=fans fans=%s max_fans=%s",
-                        article_id,
-                        result.get("fans"),
-                        max_fans,
-                    )
-                    continue
-                enrich_results.append(result)
+                results = future.result()
+                for result in results:
+                    article_id = result.get("article_id", "")
+                    status = result.get("status")
+                    if status == "skip_time":
+                        stats["skip_time"] += 1
+                        logger.info(
+                            "skip article_id=%s reason=time hours_ago=%s max_hours=%s",
+                            article_id,
+                            result.get("hours_ago"),
+                            max_hours,
+                        )
+                        continue
+                    if status == "skip_fans":
+                        stats["skip_fans"] += 1
+                        logger.info(
+                            "skip article_id=%s reason=fans fans=%s max_fans=%s",
+                            article_id,
+                            result.get("fans"),
+                            max_fans,
+                        )
+                        continue
+                    if status == "error":
+                        stats["errors"] += 1
+                        logger.warning(
+                            "detail enrich failed article_id=%s err=%s",
+                            article_id,
+                            result.get("error", "unknown"),
+                        )
+                        continue
+                    enrich_results.append(result)
             except Exception as exc:
                 stats["errors"] += 1
-                logger.exception("detail enrich failed article_id=%s err=%s", article_id, exc)
+                logger.exception("detail enrich chunk failed err=%s", exc)
 
     for idx, item in enumerate(enrich_results, start=1):
         base = item["base"]
@@ -586,7 +817,7 @@ def upsert_articles(items: List[Dict]):
             fans = int(item["fans"])
             details = item["details"]
             read_count = int(item["read_count"])
-            published_at = now - timedelta(hours=hours_ago)
+            published_at = item.get("published_at") or (now - timedelta(hours=hours_ago))
             url_hash = sha256_hex(base["url"])
             article = Article.query.filter(
                 (Article.article_id == base["article_id"]) | (Article.url_hash == url_hash)
@@ -604,9 +835,9 @@ def upsert_articles(items: List[Dict]):
             article.cover = base.get("cover", "")
             article.author = base.get("author", "")
             article.author_url = base.get("author_url", "")
-            article.publish_time_text = base.get("publish_time", "")
+            article.publish_time_text = item.get("publish_time_text") or base.get("publish_time", "")
             article.published_at = published_at
-            article.published_hours_ago = float(hours_ago)
+            article.published_hours_ago = max(0.0, (now - published_at).total_seconds() / 3600)
             article.followers = int(fans)
             # 阅读量只采用作者主页作品卡片值（详情页无可靠阅读量）
             article.view_count = int(read_count or 0)
@@ -633,7 +864,7 @@ def upsert_articles(items: List[Dict]):
         except Exception as exc:
             stats["errors"] += 1
             logger.exception("upsert failed article_id=%s err=%s", article_id, exc)
-    db.session.commit()
+    _commit_with_retry()
     logger.info(
         "upsert summary total=%s affected=%s created=%s updated=%s skip_time=%s skip_fans=%s errors=%s",
         stats["total_candidates"],
@@ -647,16 +878,186 @@ def upsert_articles(items: List[Dict]):
     return affected
 
 
-def run_crawl_job():
-    logger.info("crawl job started")
-    list_crawler = ToutiaoCrawler(headless=current_app.config["CRAWL_HEADLESS"])
+def collect_authors_from_recommend():
+    logger.info("author collect job started")
+    now = cn_now_naive()
+    max_fans = int(current_app.config["CRAWL_MAX_FANS"])
+    target_count = int(current_app.config.get("AUTHOR_COLLECT_TARGET_COUNT", current_app.config["CRAWL_TARGET_COUNT"]))
+    commit_batch_size = max(1, int(current_app.config.get("AUTHOR_COLLECT_COMMIT_BATCH_SIZE", 50)))
+    crawler = ToutiaoCrawler(headless=current_app.config["CRAWL_HEADLESS"])
+    created = 0
+    updated = 0
+    skipped = 0
+    errors = 0
     try:
-        items = list_crawler.crawl_recommend_page(current_app.config["CRAWL_TARGET_COUNT"])
+        items = crawler.crawl_recommend_page(target_count)
+        author_map = {}
+        for item in items:
+            author_url = (item.get("author_url") or "").strip()
+            author_name = (item.get("author") or "").strip()
+            if not author_url:
+                continue
+            if crawler._is_blocked_author(author_name):
+                skipped += 1
+                continue
+            author_map[author_url] = {"author_url": author_url, "author_name": author_name}
+
+        author_urls = list(author_map.keys())
+        existing_rows = []
+        if author_urls:
+            existing_rows = AuthorSource.query.filter(AuthorSource.author_url.in_(author_urls)).all()
+        existing_map = {row.author_url: row for row in existing_rows}
+
+        pending_changes = 0
+        for base in author_map.values():
+            try:
+                fans = crawler._get_author_fans_count(base["author_url"])
+                if fans >= max_fans:
+                    skipped += 1
+                    continue
+                row = existing_map.get(base["author_url"])
+                if row is None:
+                    row = AuthorSource(
+                        author_url=base["author_url"],
+                        author_name=base.get("author_name", ""),
+                        first_seen_at=now,
+                    )
+                    db.session.add(row)
+                    existing_map[base["author_url"]] = row
+                    created += 1
+                else:
+                    updated += 1
+                row.author_name = base.get("author_name", "") or row.author_name
+                row.followers = int(fans)
+                if row.status != "invalid":
+                    row.status = "active"
+                row.last_seen_at = now
+                row.last_error = ""
+                pending_changes += 1
+                if pending_changes >= commit_batch_size:
+                    _commit_with_retry()
+                    pending_changes = 0
+            except Exception as exc:
+                db.session.rollback()
+                errors += 1
+                logger.warning("author collect failed author=%s err=%s", base.get("author_url"), exc)
+        if pending_changes > 0:
+            _commit_with_retry()
+        logger.info(
+            "author collect summary candidates=%s distinct=%s created=%s updated=%s skipped=%s errors=%s",
+            len(items),
+            len(author_map),
+            created,
+            updated,
+            skipped,
+            errors,
+        )
     finally:
-        list_crawler.close()
-    logger.info("crawl list collected=%s", len(items))
-    changed = upsert_articles(items)
+        crawler.close()
+    return created + updated
+
+
+def crawl_from_author_pool():
+    logger.info("author articles job started")
+    now = cn_now_naive()
+    max_hours = float(current_app.config.get("AUTHOR_ARTICLE_MAX_HOURS", 24))
+    batch_size = int(current_app.config.get("AUTHOR_CRAWL_BATCH_SIZE", 20))
+    per_author_limit = int(current_app.config.get("AUTHOR_PER_AUTHOR_TARGET_COUNT", 20))
+    max_fails = int(current_app.config.get("AUTHOR_MAX_FAILS", 5))
+    owner = _lease_owner_name()
+    authors = acquire_author_leases(batch_size)
+    if not authors:
+        logger.info("author articles job skipped: no leasable authors")
+        return 0
+
+    crawler = ToutiaoCrawler(headless=current_app.config["CRAWL_HEADLESS"])
+    total_changed = 0
+    try:
+        for author in authors:
+            author_id = int(author.id)
+            author_url = author.author_url
+            author_name = author.author_name
+            author_followers = int(author.followers or 0)
+            try:
+                items = crawler.crawl_author_recent_articles(
+                    author_url=author_url,
+                    author_name=author_name,
+                    max_items=per_author_limit,
+                )
+                if items:
+                    for item in items:
+                        item["followers"] = author_followers
+                    changed = upsert_articles(items, max_hours=max_hours)
+                    total_changed += int(changed)
+
+                # 单作者状态更新独立提交，减少长事务锁竞争
+                now_local = cn_now_naive()
+                AuthorSource.query.filter(
+                    AuthorSource.id == author_id, AuthorSource.lease_owner == owner
+                ).update(
+                    {
+                        AuthorSource.last_crawled_at: now_local,
+                        AuthorSource.fail_count: 0,
+                        AuthorSource.last_error: "",
+                        AuthorSource.lease_owner: "",
+                        AuthorSource.lease_until: None,
+                    },
+                    synchronize_session=False,
+                )
+                _commit_with_retry()
+            except Exception as exc:
+                # 先回滚坏事务，避免 PendingRollbackError 连锁
+                db.session.rollback()
+                try:
+                    row = AuthorSource.query.filter(AuthorSource.id == author_id).first()
+                    if row:
+                        row.fail_count = int(row.fail_count or 0) + 1
+                        row.last_error = str(exc)[:500]
+                        if row.fail_count >= max_fails:
+                            row.status = "invalid"
+                        row.lease_owner = ""
+                        row.lease_until = None
+                        _commit_with_retry()
+                except Exception as update_exc:
+                    db.session.rollback()
+                    logger.warning(
+                        "author crawl status update failed author=%s err=%s",
+                        author_url,
+                        update_exc,
+                    )
+                logger.warning(
+                    "author crawl failed author=%s fail_count=%s err=%s",
+                    author_url,
+                    (row.fail_count if "row" in locals() and row else "n/a"),
+                    exc,
+                )
+    finally:
+        crawler.close()
+    logger.info(
+        "author articles summary owner=%s processed_authors=%s changed_articles=%s max_hours=%s elapsed_seconds=%.2f",
+        owner,
+        len(authors),
+        total_changed,
+        max_hours,
+        (cn_now_naive() - now).total_seconds(),
+    )
+    return total_changed
+
+
+def run_crawl_job():
+    # backward compatible wrapper
+    logger.info("crawl job started (legacy wrapper)")
+    collect_authors_from_recommend()
+    changed = crawl_from_author_pool()
     logger.info("crawl job finished, upserted=%s", changed)
+
+
+def run_author_collect_job():
+    collect_authors_from_recommend()
+
+
+def run_author_articles_job():
+    crawl_from_author_pool()
 
 
 def cleanup_expired_articles():

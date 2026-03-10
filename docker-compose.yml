@@ -10,6 +10,8 @@ services:
     environment:
       TZ: ${TZ:-Asia/Shanghai}
       CRAWL_JOB_ENABLED: "false"
+      AUTHOR_COLLECT_JOB_ENABLED: "false"
+      AUTHOR_ARTICLES_JOB_ENABLED: "false"
       CLEANUP_JOB_ENABLED: "false"
       # 容器内 Selenium 路径默认值；如 .env 已设置则以 .env 为准
       CHROMEDRIVER_PATH: ${CHROMEDRIVER_PATH:-/usr/bin/chromedriver}
@@ -17,18 +19,40 @@ services:
     ports:
       - "5000:5000"
 
-  crawler:
+  author-collect:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: jrtt-crawler
+    container_name: jrtt-author-collect
     restart: unless-stopped
     command: ["python", "run_crawler.py"]
     env_file:
       - .env
     environment:
       TZ: ${TZ:-Asia/Shanghai}
-      CRAWL_JOB_ENABLED: "true"
+      CRAWL_JOB_ENABLED: "false"
+      AUTHOR_COLLECT_JOB_ENABLED: "true"
+      AUTHOR_ARTICLES_JOB_ENABLED: "false"
+      CLEANUP_JOB_ENABLED: "false"
+      WORKER_ROLE: "author-collect"
+      CHROMEDRIVER_PATH: ${CHROMEDRIVER_PATH:-/usr/bin/chromedriver}
+      CHROME_BINARY_PATH: ${CHROME_BINARY_PATH:-/usr/bin/chromium}
+
+  author-articles:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: jrtt-author-articles
+    restart: unless-stopped
+    command: ["python", "run_crawler.py"]
+    env_file:
+      - .env
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      CRAWL_JOB_ENABLED: "false"
+      AUTHOR_COLLECT_JOB_ENABLED: "false"
+      AUTHOR_ARTICLES_JOB_ENABLED: "true"
       CLEANUP_JOB_ENABLED: "true"
+      WORKER_ROLE: "author-articles"
       CHROMEDRIVER_PATH: ${CHROMEDRIVER_PATH:-/usr/bin/chromedriver}
       CHROME_BINARY_PATH: ${CHROME_BINARY_PATH:-/usr/bin/chromium}

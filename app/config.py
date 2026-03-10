@@ -27,11 +27,25 @@ class Config:
     CLEANUP_INTERVAL_MINUTES = int(os.getenv("CLEANUP_INTERVAL_MINUTES", "30"))
     CRAWL_JOB_ENABLED = os.getenv("CRAWL_JOB_ENABLED", "true").lower() == "true"
     CLEANUP_JOB_ENABLED = os.getenv("CLEANUP_JOB_ENABLED", "true").lower() == "true"
+    AUTHOR_COLLECT_JOB_ENABLED = os.getenv("AUTHOR_COLLECT_JOB_ENABLED", "true").lower() == "true"
+    AUTHOR_ARTICLES_JOB_ENABLED = os.getenv("AUTHOR_ARTICLES_JOB_ENABLED", "true").lower() == "true"
     CRAWL_TARGET_COUNT = int(os.getenv("CRAWL_TARGET_COUNT", "20"))
     CRAWL_LIST_SCROLL_ROUNDS = int(os.getenv("CRAWL_LIST_SCROLL_ROUNDS", "6"))
     CRAWL_DETAIL_WORKERS = int(os.getenv("CRAWL_DETAIL_WORKERS", "3"))
     CRAWL_MAX_HOURS = float(os.getenv("CRAWL_MAX_HOURS", "24"))
     CRAWL_MAX_FANS = int(os.getenv("CRAWL_MAX_FANS", "10000"))
+    AUTHOR_COLLECT_INTERVAL_SECONDS = int(os.getenv("AUTHOR_COLLECT_INTERVAL_SECONDS", "120"))
+    AUTHOR_COLLECT_TARGET_COUNT = int(os.getenv("AUTHOR_COLLECT_TARGET_COUNT", "200"))
+    AUTHOR_CRAWL_INTERVAL_SECONDS = int(os.getenv("AUTHOR_CRAWL_INTERVAL_SECONDS", "120"))
+    AUTHOR_CRAWL_BATCH_SIZE = int(os.getenv("AUTHOR_CRAWL_BATCH_SIZE", "20"))
+    AUTHOR_PER_AUTHOR_TARGET_COUNT = int(os.getenv("AUTHOR_PER_AUTHOR_TARGET_COUNT", "20"))
+    AUTHOR_ARTICLE_SCROLL_ROUNDS = int(os.getenv("AUTHOR_ARTICLE_SCROLL_ROUNDS", "4"))
+    AUTHOR_ARTICLE_MAX_HOURS = float(os.getenv("AUTHOR_ARTICLE_MAX_HOURS", "24"))
+    AUTHOR_MAX_FAILS = int(os.getenv("AUTHOR_MAX_FAILS", "5"))
+    AUTHOR_LEASE_SECONDS = int(os.getenv("AUTHOR_LEASE_SECONDS", "240"))
+    AUTHOR_COLLECT_COMMIT_BATCH_SIZE = int(os.getenv("AUTHOR_COLLECT_COMMIT_BATCH_SIZE", "50"))
+    JOB_JITTER_SECONDS = int(os.getenv("JOB_JITTER_SECONDS", "10"))
+    WORKER_ROLE = os.getenv("WORKER_ROLE", "")
     CRAWL_BLOCK_AUTHOR_KEYWORDS = os.getenv(
         "CRAWL_BLOCK_AUTHOR_KEYWORDS",
         "政府,检察院,法院,公安,交警,消防,税务,纪委,共青团,网信办,发布,融媒体中心",

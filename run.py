@@ -2,7 +2,7 @@ import os
 
 from app import create_app
 
-app = create_app()
+app = create_app(enable_scheduler=False)
 
 if __name__ == "__main__":
     debug = os.getenv("DEBUG", "false").lower() == "true"

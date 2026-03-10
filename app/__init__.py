@@ -22,7 +22,7 @@ class ShanghaiFormatter(logging.Formatter):
         return dt.strftime("%Y-%m-%d %H:%M:%S")
 
 
-def create_app() -> Flask:
+def create_app(enable_scheduler: bool = True) -> Flask:
     app = Flask(__name__)
     app.config.from_object(Config)
     log_format = "%(asctime)s %(levelname)s %(name)s - %(message)s"
@@ -57,8 +57,11 @@ def create_app() -> Flask:
         logging.exception("Unhandled error: %s", err)
         return error_response(5000, "服务异常")
 
-    scheduler.init_app(app)
-    scheduler.start()
-    app.logger.info("Scheduler started")
+    if enable_scheduler:
+        scheduler.init_app(app)
+        scheduler.start()
+        app.logger.info("Scheduler started")
+    else:
+        app.logger.info("Scheduler disabled for this process")
 
     return app
