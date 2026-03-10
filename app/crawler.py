@@ -6,12 +6,15 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional
+from urllib.parse import urlsplit, urlunsplit
 
 from bs4 import BeautifulSoup
 from flask import current_app
 from selenium import webdriver
-from selenium.common.exceptions import InvalidSessionIdException, WebDriverException
+from selenium.common.exceptions import InvalidSessionIdException, TimeoutException, WebDriverException
 from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
 from sqlalchemy import or_
 from sqlalchemy.exc import SQLAlchemyError
 from webdriver_manager.chrome import ChromeDriverManager
@@ -61,6 +64,27 @@ def _lease_owner_name() -> str:
     if raw:
         return raw
     return f"worker-{os.getpid()}"
+
+
+def normalize_article_url(url: str) -> str:
+    if not url:
+        return ""
+    raw = str(url).strip()
+    if raw.startswith("//"):
+        raw = f"https:{raw}"
+    if raw.startswith("/"):
+        raw = f"https://www.toutiao.com{raw}"
+
+    parts = urlsplit(raw)
+    scheme = parts.scheme or "https"
+    netloc = parts.netloc or "www.toutiao.com"
+    path = parts.path or ""
+
+    # 统一文章链接形态，去掉 query/fragment（例如 #comment）
+    m = re.search(r"/article/(\d+)/?", path)
+    if m:
+        path = f"/article/{m.group(1)}/"
+    return urlunsplit((scheme, netloc, path, "", ""))
 
 
 def acquire_author_leases(limit: int) -> List[AuthorSource]:
@@ -276,6 +300,7 @@ class ToutiaoCrawler:
             article_url = title_elem.get("href", "")
             if not article_url.startswith("http"):
                 article_url = f"https://www.toutiao.com{article_url}"
+            article_url = normalize_article_url(article_url)
 
             article_id_match = re.search(r"/article/(\d+)/", article_url)
             if not article_id_match:
@@ -385,6 +410,22 @@ class ToutiaoCrawler:
             logger.warning("get fans failed: %s", exc)
         return 0
 
+    def _extract_article_container(self, soup: BeautifulSoup):
+        selectors = [
+            "article.syl-article-base",
+            ".syl-article-base",
+            ".article-content",
+            ".a-con",
+            ".tt-article-content",
+            ".content",
+            "article",
+        ]
+        for selector in selectors:
+            node = soup.select_one(selector)
+            if node:
+                return node
+        return None
+
     def _get_article_details(self, article_url: str) -> Dict:
         detail = {
             "like_count": 0,
@@ -395,8 +436,24 @@ class ToutiaoCrawler:
             "published_at": None,
         }
         try:
+            article_url = normalize_article_url(article_url)
             self._safe_get(article_url)
-            time.sleep(1.5)
+            self._safe_execute_script("window.scrollTo(0, 0);")
+            selectors = [
+                "article.syl-article-base",
+                ".syl-article-base",
+                ".article-content",
+                ".a-con",
+                ".tt-article-content",
+                "article",
+            ]
+            try:
+                WebDriverWait(self.driver, 5).until(
+                    lambda d: any(d.find_elements(By.CSS_SELECTOR, s) for s in selectors)
+                )
+            except TimeoutException:
+                # 页面结构不稳定时继续走兜底解析，不中断流程
+                time.sleep(1.0)
             html = self._safe_page_source()
             soup = BeautifulSoup(html, "html.parser")
 
@@ -447,13 +504,11 @@ class ToutiaoCrawler:
                             detail["comment_count"] = int(m.group(1))
                         break
 
-            container = (
-                soup.select_one("article.syl-article-base")
-                or soup.select_one(".syl-article-base")
-                or soup.select_one("article")
-            )
+            container = self._extract_article_container(soup)
             if container:
                 detail["article_html"] = str(container)
+            else:
+                logger.info("empty article html extracted url=%s", article_url)
 
             title_elem = soup.select_one("h1") or soup.select_one("title")
             if title_elem:
@@ -640,6 +695,7 @@ class ToutiaoCrawler:
                 if "/article/" not in href:
                     continue
                 article_url = href if href.startswith("http") else f"https://www.toutiao.com{href}"
+                article_url = normalize_article_url(article_url)
                 m = re.search(r"/article/(\d+)/", article_url)
                 if not m:
                     continue
@@ -694,6 +750,8 @@ def upsert_articles(items: List[Dict], max_hours: Optional[float] = None):
         "total_candidates": len(items),
         "skip_time": 0,
         "skip_fans": 0,
+        "empty_html": 0,
+        "skip_empty_html_create": 0,
         "created": 0,
         "updated": 0,
         "errors": 0,
@@ -817,12 +875,20 @@ def upsert_articles(items: List[Dict], max_hours: Optional[float] = None):
             fans = int(item["fans"])
             details = item["details"]
             read_count = int(item["read_count"])
+            base["url"] = normalize_article_url(base.get("url", ""))
             published_at = item.get("published_at") or (now - timedelta(hours=hours_ago))
             url_hash = sha256_hex(base["url"])
             article = Article.query.filter(
                 (Article.article_id == base["article_id"]) | (Article.url_hash == url_hash)
             ).first()
             is_new = article is None
+            article_html = (details.get("article_html") or "").strip()
+            if not article_html:
+                stats["empty_html"] += 1
+                if is_new:
+                    stats["skip_empty_html_create"] += 1
+                    logger.info("skip create article_id=%s reason=empty_source_html", article_id)
+                    continue
             if is_new:
                 article = Article(article_id=base["article_id"], url_hash=url_hash, url=base["url"])
                 db.session.add(article)
@@ -848,7 +914,8 @@ def upsert_articles(items: List[Dict], max_hours: Optional[float] = None):
                     int(base.get("comment_count") or 0),
                 )
             )
-            article.source_html = details.get("article_html") or ""
+            if article_html:
+                article.source_html = article_html
             article.last_seen_at = now
             affected += 1
             logger.info(
@@ -866,13 +933,15 @@ def upsert_articles(items: List[Dict], max_hours: Optional[float] = None):
             logger.exception("upsert failed article_id=%s err=%s", article_id, exc)
     _commit_with_retry()
     logger.info(
-        "upsert summary total=%s affected=%s created=%s updated=%s skip_time=%s skip_fans=%s errors=%s",
+        "upsert summary total=%s affected=%s created=%s updated=%s skip_time=%s skip_fans=%s empty_html=%s skip_empty_create=%s errors=%s",
         stats["total_candidates"],
         affected,
         stats["created"],
         stats["updated"],
         stats["skip_time"],
         stats["skip_fans"],
+        stats["empty_html"],
+        stats["skip_empty_html_create"],
         stats["errors"],
     )
     return affected
