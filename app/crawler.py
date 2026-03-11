@@ -955,23 +955,35 @@ class ToutiaoCrawler:
                     parent = parent.parent
 
                 cover = ""
-                cover_node = link
-                # 尽量从当前链接附近向上回溯卡片容器，再找封面图片
-                for _ in range(8):
-                    if cover_node is None:
-                        break
-                    img = cover_node.find("img")
-                    if img:
-                        cover = (
-                            img.get("src")
-                            or img.get("data-src")
-                            or img.get("data-original")
-                            or img.get("original-src")
-                            or ""
-                        ).strip()
-                        if cover:
+                # 先直接看当前链接内部是否有 img（封面 <a> 内嵌图片）
+                direct_img = link.find("img")
+                if direct_img:
+                    cover = (
+                        direct_img.get("src")
+                        or direct_img.get("data-src")
+                        or direct_img.get("data-original")
+                        or direct_img.get("original-src")
+                        or ""
+                    ).strip()
+                if not cover:
+                    # 向上回溯，专门查找 feed-card-cover 容器内的封面图
+                    card = link.parent
+                    for _ in range(10):
+                        if card is None:
                             break
-                    cover_node = cover_node.parent
+                        cover_div = card.find(class_="feed-card-cover")
+                        if cover_div:
+                            img = cover_div.find("img")
+                            if img:
+                                cover = (
+                                    img.get("src")
+                                    or img.get("data-src")
+                                    or img.get("data-original")
+                                    or img.get("original-src")
+                                    or ""
+                                ).strip()
+                            break
+                        card = card.parent
                 if cover.startswith("//"):
                     cover = f"https:{cover}"
                 found_map[article_id] = {
