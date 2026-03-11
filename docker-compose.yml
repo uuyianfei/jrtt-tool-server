@@ -25,7 +25,12 @@ services:
       dockerfile: Dockerfile
     container_name: jrtt-author-collect
     restart: unless-stopped
-    command: ["xvfb-run", "-a", "-s", "-screen 0 1920x1080x24", "python", "run_crawler.py"]
+    command:
+      [
+        "sh",
+        "-lc",
+        "Xvfb :99 -screen 0 1920x1080x24 -nolisten tcp & export DISPLAY=:99; exec python -u run_crawler.py",
+      ]
     env_file:
       - .env
     environment:
@@ -38,6 +43,8 @@ services:
       CHROMEDRIVER_PATH: ${CHROMEDRIVER_PATH:-/usr/bin/chromedriver}
       CHROME_BINARY_PATH: ${CHROME_BINARY_PATH:-/usr/bin/chromium}
       CRAWL_HEADLESS: "false"
+      PYTHONUNBUFFERED: "1"
+      DISPLAY: ":99"
 
   author-articles:
     build:
@@ -45,7 +52,12 @@ services:
       dockerfile: Dockerfile
     container_name: jrtt-author-articles
     restart: unless-stopped
-    command: ["xvfb-run", "-a", "-s", "-screen 0 1920x1080x24", "python", "run_crawler.py"]
+    command:
+      [
+        "sh",
+        "-lc",
+        "Xvfb :99 -screen 0 1920x1080x24 -nolisten tcp & export DISPLAY=:99; exec python -u run_crawler.py",
+      ]
     env_file:
       - .env
     environment:
@@ -58,3 +70,5 @@ services:
       CHROMEDRIVER_PATH: ${CHROMEDRIVER_PATH:-/usr/bin/chromedriver}
       CHROME_BINARY_PATH: ${CHROME_BINARY_PATH:-/usr/bin/chromium}
       CRAWL_HEADLESS: "false"
+      PYTHONUNBUFFERED: "1"
+      DISPLAY: ":99"
