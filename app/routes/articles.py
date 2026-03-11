@@ -60,6 +60,14 @@ def _build_filtered_query(body):
     return q, None
 
 
+def _format_publish_time(hours_ago: float) -> str:
+    value = max(0.0, float(hours_ago or 0.0))
+    if value < 1:
+        minutes = max(1, int(round(value * 60)))
+        return f"{minutes}分钟前发布"
+    return f"{int(value)}小时前发布"
+
+
 @articles_bp.post("/articles/search")
 def search_articles():
     body = request.get_json(silent=True) or {}
@@ -91,7 +99,7 @@ def search_articles():
                 "likes": format_compact_number(row.like_count),
                 "comments": format_compact_number(row.comment_count),
                 "views": format_compact_number(row.view_count),
-                "time": f"{int(hours_ago)}小时前发布",
+                "time": _format_publish_time(hours_ago),
                 "link": row.url,
                 "followers": row.followers,
                 "viewCount": row.view_count,
