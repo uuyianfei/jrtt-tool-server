@@ -3,7 +3,7 @@ from datetime import datetime, timedelta
 
 from apscheduler.schedulers.background import BackgroundScheduler
 
-from .crawler import cleanup_expired_articles, run_author_articles_job, run_author_collect_job, run_crawl_job
+from .crawler import cleanup_expired_articles, run_author_articles_job, run_author_articles_loop, run_author_collect_job, run_crawl_job
 
 logger = logging.getLogger(__name__)
 
@@ -17,6 +17,7 @@ class AppScheduler:
         crawl_seconds = app.config["CRAWL_INTERVAL_SECONDS"]
         author_collect_seconds = app.config["AUTHOR_COLLECT_INTERVAL_SECONDS"]
         author_articles_seconds = app.config["AUTHOR_CRAWL_INTERVAL_SECONDS"]
+        author_articles_continuous = bool(app.config.get("AUTHOR_ARTICLES_CONTINUOUS_ENABLED", True))
         cleanup_minutes = app.config["CLEANUP_INTERVAL_MINUTES"]
         job_jitter = int(app.config.get("JOB_JITTER_SECONDS", 0))
         crawl_enabled = bool(app.config.get("CRAWL_JOB_ENABLED", True))
@@ -48,7 +49,10 @@ class AppScheduler:
         def author_articles_wrapper():
             with app.app_context():
                 try:
-                    run_author_articles_job()
+                    if author_articles_continuous:
+                        run_author_articles_loop()
+                    else:
+                        run_author_articles_job()
                 except Exception as exc:
                     logger.exception("author articles job error: %s", exc)
 
@@ -67,17 +71,29 @@ class AppScheduler:
             logger.info("author collect job disabled by AUTHOR_COLLECT_JOB_ENABLED=false")
 
         if author_articles_enabled:
-            self.scheduler.add_job(
-                author_articles_wrapper,
-                trigger="interval",
-                seconds=author_articles_seconds,
-                id="author_articles_job",
-                replace_existing=True,
-                max_instances=1,
-                # 与作者采集任务错峰启动，减少 author_sources 行锁争用
-                next_run_time=datetime.now() + timedelta(seconds=10),
-                jitter=job_jitter,
-            )
+            if author_articles_continuous:
+                self.scheduler.add_job(
+                    author_articles_wrapper,
+                    trigger="date",
+                    id="author_articles_job",
+                    replace_existing=True,
+                    max_instances=1,
+                    # 启动后以常驻循环运行，不再走固定间隔调度
+                    next_run_time=datetime.now() + timedelta(seconds=10),
+                )
+                logger.info("author articles job running in continuous loop mode")
+            else:
+                self.scheduler.add_job(
+                    author_articles_wrapper,
+                    trigger="interval",
+                    seconds=author_articles_seconds,
+                    id="author_articles_job",
+                    replace_existing=True,
+                    max_instances=1,
+                    # 与作者采集任务错峰启动，减少 author_sources 行锁争用
+                    next_run_time=datetime.now() + timedelta(seconds=10),
+                    jitter=job_jitter,
+                )
         else:
             logger.info("author articles job disabled by AUTHOR_ARTICLES_JOB_ENABLED=false")
 

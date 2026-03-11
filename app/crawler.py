@@ -1,9 +1,11 @@
 import logging
 import os
 import re
+import threading
 import time
 import json
 import html
+import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -27,6 +29,7 @@ from .utils import parse_hours_ago, parse_number, parse_publish_datetime, sha256
 
 
 logger = logging.getLogger(__name__)
+_AUTHOR_ARTICLES_JOB_LOCK = threading.Lock()
 
 
 def _is_deadlock_error(exc: Exception) -> bool:
@@ -104,12 +107,16 @@ def acquire_author_leases(limit: int) -> List[AuthorSource]:
     now = cn_now_naive()
     owner = _lease_owner_name()
     lease_seconds = int(current_app.config.get("AUTHOR_LEASE_SECONDS", 240))
+    recrawl_interval_hours = float(current_app.config.get("AUTHOR_RECRAWL_INTERVAL_HOURS", 5))
+    earliest_next_crawl_at = now - timedelta(hours=max(0.0, recrawl_interval_hours))
     lease_until = now + timedelta(seconds=lease_seconds)
 
     # 先多取一些候选，允许在竞争中部分领取失败
     candidate_rows = (
         AuthorSource.query.filter(
             AuthorSource.status == "active",
+            AuthorSource.followers > 0,
+            or_(AuthorSource.last_crawled_at.is_(None), AuthorSource.last_crawled_at <= earliest_next_crawl_at),
             or_(AuthorSource.lease_until.is_(None), AuthorSource.lease_until < now),
         )
         .order_by(AuthorSource.last_crawled_at.isnot(None), AuthorSource.last_crawled_at.asc(), AuthorSource.id.asc())
@@ -122,6 +129,8 @@ def acquire_author_leases(limit: int) -> List[AuthorSource]:
             AuthorSource.query.filter(
                 AuthorSource.id == row.id,
                 AuthorSource.status == "active",
+                AuthorSource.followers > 0,
+                or_(AuthorSource.last_crawled_at.is_(None), AuthorSource.last_crawled_at <= earliest_next_crawl_at),
                 or_(AuthorSource.lease_until.is_(None), AuthorSource.lease_until < now),
             )
             .update(
@@ -165,10 +174,9 @@ class ToutiaoCrawler:
         options.add_argument("--disable-blink-features=AutomationControlled")
         options.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])
         options.add_experimental_option("useAutomationExtension", False)
-        options.add_argument(
-            "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        )
+        custom_ua = (current_app.config.get("CRAWL_USER_AGENT") or "").strip()
+        if custom_ua:
+            options.add_argument(f"user-agent={custom_ua}")
         driver_path = self._resolve_driver_path()
         if driver_path:
             logger.info("use local chromedriver: %s", driver_path)
@@ -184,9 +192,22 @@ class ToutiaoCrawler:
                 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
                 Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
                 Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh'] });
+                window.chrome = window.chrome || { runtime: {} };
                 """
             },
         )
+        try:
+            driver.execute_cdp_cmd("Network.enable", {})
+            driver.execute_cdp_cmd(
+                "Network.setExtraHTTPHeaders",
+                {
+                    "headers": {
+                        "Referer": "https://www.toutiao.com/",
+                    }
+                },
+            )
+        except Exception as exc:
+            logger.debug("cdp network header setup skipped: %s", exc)
         return driver
 
     def _resolve_driver_path(self) -> str:
@@ -216,11 +237,75 @@ class ToutiaoCrawler:
     def _safe_get(self, url: str):
         try:
             self.driver.get(url)
+            self._recover_blank_article_page(url)
             return
         except (InvalidSessionIdException, WebDriverException) as exc:
             logger.warning("webdriver get failed, retry once: %s", exc)
             self._recreate_driver()
             self.driver.get(url)
+            self._recover_blank_article_page(url)
+
+    def _looks_like_blank_page(self, html_text: str) -> bool:
+        text = BeautifulSoup(html_text or "", "html.parser").get_text(" ", strip=True)
+        if len(text) >= 60:
+            return False
+        compact = (html_text or "").lower()
+        # 命中常见正文/初始化状态标记时，不视为空白页
+        non_blank_markers = [
+            "__initial_state__",
+            "syl-article-base",
+            "tt-article-content",
+            "pgc-article",
+            "<article",
+        ]
+        return not any(marker in compact for marker in non_blank_markers)
+
+    def _recover_blank_article_page(self, url: str):
+        """
+        头条偶发返回空白壳页：自动做轻量恢复，避免直接进入后续解析。
+        """
+        if not re.search(r"^https?://(?:www\.)?toutiao\.com/article/\d+/?", str(url or "")):
+            return
+        try:
+            max_rounds = max(1, int(current_app.config.get("BLANK_PAGE_RECOVERY_MAX_ROUNDS", 2)))
+            html_text = self._safe_page_source()
+            if not self._looks_like_blank_page(html_text):
+                return
+
+            logger.info("blank detail page detected, try recover url=%s rounds=%s", url, max_rounds)
+            for round_idx in range(1, max_rounds + 1):
+                # 1) 刷新重试
+                self._safe_refresh()
+                time.sleep(0.8 + random.random() * 0.8)
+                html_text = self._safe_page_source()
+                if not self._looks_like_blank_page(html_text):
+                    logger.info("blank page recovered by refresh url=%s round=%s", url, round_idx)
+                    return
+
+                # 2) 回首页建立会话，再跳详情
+                self.driver.get("https://www.toutiao.com/")
+                time.sleep(1.0 + random.random() * 1.0)
+                self.driver.get(url)
+                time.sleep(1.0 + random.random() * 1.0)
+                html_text = self._safe_page_source()
+                if not self._looks_like_blank_page(html_text):
+                    logger.info("blank page recovered by home-jump url=%s round=%s", url, round_idx)
+                    return
+
+                # 3) 仍空白时重建驱动，避免会话被风控持续污染
+                self._recreate_driver()
+                self.driver.get("https://www.toutiao.com/")
+                time.sleep(1.2 + random.random() * 1.0)
+                self.driver.get(url)
+                time.sleep(1.0 + random.random() * 1.0)
+                html_text = self._safe_page_source()
+                if not self._looks_like_blank_page(html_text):
+                    logger.info("blank page recovered by recreate-driver url=%s round=%s", url, round_idx)
+                    return
+
+            logger.warning("blank page recovery failed url=%s", url)
+        except Exception as exc:
+            logger.debug("blank page recovery skipped url=%s err=%s", url, exc)
 
     def _safe_refresh(self):
         try:
@@ -529,8 +614,9 @@ class ToutiaoCrawler:
             article_url = normalize_article_url(article_url)
             self._safe_get(article_url)
             self._safe_execute_script("window.scrollTo(0, 0);")
+            ready_timeout = max(6, int(current_app.config.get("DETAIL_PAGE_READY_TIMEOUT_SECONDS", 12)))
             try:
-                self._wait_article_ready(timeout_seconds=6)
+                self._wait_article_ready(timeout_seconds=ready_timeout)
             except TimeoutException:
                 # 页面结构不稳定时继续走兜底解析，不中断流程
                 time.sleep(1.0)
@@ -599,7 +685,7 @@ class ToutiaoCrawler:
             if not self._is_meaningful_article_html(detail.get("article_html", "")):
                 try:
                     self._safe_execute_script("window.scrollTo(0, 0);")
-                    self._wait_article_ready(timeout_seconds=5)
+                    self._wait_article_ready(timeout_seconds=max(6, ready_timeout - 2))
                 except Exception:
                     time.sleep(0.8)
                 html_retry = self._safe_page_source()
@@ -615,6 +701,11 @@ class ToutiaoCrawler:
                     if fallback_retry:
                         detail["article_html"] = fallback_retry
                         logger.info("article html extracted via retry script fallback url=%s", article_url)
+
+            # 最终保护：所有重试结束后正文仍不够有意义时，清空以避免空壳 HTML 入库
+            if not self._is_meaningful_article_html(detail.get("article_html", "")):
+                logger.info("article html not meaningful after all retries, clearing url=%s", article_url)
+                detail["article_html"] = ""
 
             title_elem = soup.select_one("h1") or soup.select_one("title")
             if title_elem:
@@ -788,10 +879,29 @@ class ToutiaoCrawler:
     def crawl_author_recent_articles(self, author_url: str, author_name: str = "", max_items: int = 30) -> List[Dict]:
         if not author_url:
             return []
+        logger.info(
+            "author recent crawl start author=%s max_items=%s",
+            author_url,
+            max_items,
+        )
         scroll_rounds = int(current_app.config.get("AUTHOR_ARTICLE_SCROLL_ROUNDS", 4))
         found_map = {}
         self._safe_get(author_url)
         time.sleep(1.2)
+        # 评论按钮、互动组件等也会含有 /article/ 链接（例如 /article/123/#comment），
+        # 识别出这些伪标题后仍保留文章，但不使用伪标题（由详情页补充真实标题）
+        _BAD_TITLE_RE = re.compile(
+            r"^(?:"
+            r"评论\d*|\d+评论"
+            r"|回复\d*|\d+回复"
+            r"|转发\d*|\d+转发"
+            r"|点赞\d*|\d+点赞"
+            r"|分享\d*|\d+分享"
+            r"|收藏\d*|\d+收藏"
+            r"|举报"
+            r"|\d+$"
+            r")$"
+        )
         for _ in range(scroll_rounds):
             html = self._safe_page_source()
             soup = BeautifulSoup(html, "html.parser")
@@ -807,8 +917,26 @@ class ToutiaoCrawler:
                     continue
                 article_id = m.group(1)
                 title = (link.get_text(strip=True) or link.get("title") or "").strip()
-                if not title:
-                    continue
+
+                # 判断是否为评论/互动组件的伪标题
+                is_bad_title = (
+                    (not title)
+                    or _BAD_TITLE_RE.match(title)
+                    or len(title) < 4
+                )
+
+                if is_bad_title:
+                    # 已有该文章的正常标题 → 不覆盖，直接跳过
+                    if article_id in found_map and found_map[article_id].get("title"):
+                        continue
+                    # 尚未收集该文章 → 保留文章但标题留空，后续由详情页补充
+                    logger.debug("comment/interaction link, keep article with empty title text=%s href=%s", title, href[:80])
+                    title = ""
+                else:
+                    # 正常标题：如果已有该文章的正常标题，不重复覆盖
+                    if article_id in found_map and found_map[article_id].get("title"):
+                        continue
+
                 publish_time = ""
                 parent = link
                 for _ in range(8):
@@ -828,7 +956,7 @@ class ToutiaoCrawler:
                 found_map[article_id] = {
                     "article_id": article_id,
                     "url": article_url,
-                    "title": title[:200],
+                    "title": title[:200] if title else "",
                     "author": author_name or "",
                     "author_url": author_url,
                     "publish_time": publish_time,
@@ -841,10 +969,16 @@ class ToutiaoCrawler:
                 break
             self._safe_execute_script("window.scrollTo(0, document.body.scrollHeight);")
             time.sleep(1.0)
-        return list(found_map.values())[:max_items]
+        results = list(found_map.values())[:max_items]
+        logger.info(
+            "author recent crawl done author=%s found=%s",
+            author_url,
+            len(results),
+        )
+        return results
 
 
-def upsert_articles(items: List[Dict], max_hours: Optional[float] = None):
+def upsert_articles(items: List[Dict], max_hours: Optional[float] = None, min_views: int = 0):
     now = cn_now_naive()
     app = current_app._get_current_object()
     max_hours = float(max_hours if max_hours is not None else current_app.config["CRAWL_MAX_HOURS"])
@@ -856,6 +990,7 @@ def upsert_articles(items: List[Dict], max_hours: Optional[float] = None):
         "total_candidates": len(items),
         "skip_time": 0,
         "skip_fans": 0,
+        "skip_views": 0,
         "empty_html": 0,
         "skip_empty_html_create": 0,
         "created": 0,
@@ -878,6 +1013,11 @@ def upsert_articles(items: List[Dict], max_hours: Optional[float] = None):
                         fans = int(base.get("followers") or 0)
                         if fans <= 0:
                             fans = crawler._get_author_fans_count(base.get("author_url", ""))
+                        if fans <= 0:
+                            chunk_results.append(
+                                {"status": "skip_fans", "article_id": article_id, "fans": fans}
+                            )
+                            continue
                         if fans >= max_fans:
                             chunk_results.append(
                                 {"status": "skip_fans", "article_id": article_id, "fans": fans}
@@ -904,6 +1044,11 @@ def upsert_articles(items: List[Dict], max_hours: Optional[float] = None):
                             article_title=base.get("title", ""),
                             article_url=base.get("url", ""),
                         )
+                        if min_views > 0 and int(read_count or 0) < min_views:
+                            chunk_results.append(
+                                {"status": "skip_views", "article_id": article_id, "views": int(read_count or 0)}
+                            )
+                            continue
                         chunk_results.append(
                             {
                                 "status": "ok",
@@ -936,6 +1081,15 @@ def upsert_articles(items: List[Dict], max_hours: Optional[float] = None):
                 for result in results:
                     article_id = result.get("article_id", "")
                     status = result.get("status")
+                    if status == "skip_views":
+                        stats["skip_views"] += 1
+                        logger.info(
+                            "skip article_id=%s reason=low_views views=%s min_views=%s",
+                            article_id,
+                            result.get("views"),
+                            min_views,
+                        )
+                        continue
                     if status == "skip_time":
                         stats["skip_time"] += 1
                         logger.info(
@@ -993,11 +1147,17 @@ def upsert_articles(items: List[Dict], max_hours: Optional[float] = None):
             ).first()
             is_new = article is None
             article_html = (details.get("article_html") or "").strip()
-            if not article_html:
+            # 使用与 _is_meaningful_article_html 一致的文本长度检查，
+            # 避免仅含空壳容器标签的 HTML 通过空字符串判断后入库
+            article_text = ""
+            if article_html:
+                article_text = BeautifulSoup(article_html, "html.parser").get_text(" ", strip=True)
+            html_is_meaningful = len(article_text) >= 80
+            if not html_is_meaningful:
                 stats["empty_html"] += 1
                 if is_new:
                     stats["skip_empty_html_create"] += 1
-                    logger.info("skip create article_id=%s reason=empty_source_html", article_id)
+                    logger.info("skip create article_id=%s reason=empty_source_html (text_len=%s)", article_id, len(article_text))
                     continue
             if is_new:
                 article = Article(article_id=base["article_id"], url_hash=url_hash, url=base["url"])
@@ -1006,7 +1166,23 @@ def upsert_articles(items: List[Dict], max_hours: Optional[float] = None):
             else:
                 stats["updated"] += 1
 
-            article.title = details.get("title") or base.get("title") or "无标题"
+            # 标题合法性校验：过滤掉评论按钮等伪标题
+            _INVALID_TITLE_RE = re.compile(
+                r"^(?:评论\d*|\d+评论|回复\d*|\d+回复|转发\d*|\d+转发|点赞\d*|\d+点赞|分享\d*|\d+分享|收藏\d*|\d+收藏|举报|\d+)$"
+            )
+            detail_title = (details.get("title") or "").strip()
+            base_title = (base.get("title") or "").strip()
+            # 优先使用详情页标题；如果详情页标题也无效则使用列表标题
+            chosen_title = detail_title or base_title or "无标题"
+            if _INVALID_TITLE_RE.match(chosen_title) or len(chosen_title) < 4:
+                # 标题异常时：新文章跳过，已有文章保留原标题不覆盖
+                if is_new:
+                    stats["errors"] += 1
+                    logger.warning("skip create article_id=%s reason=invalid_title title=%s", article_id, chosen_title)
+                    continue
+                else:
+                    chosen_title = article.title  # 保留数据库中原有标题
+            article.title = chosen_title
             article.url = base["url"]
             article.url_hash = url_hash
             article.cover = base.get("cover", "")
@@ -1025,7 +1201,7 @@ def upsert_articles(items: List[Dict], max_hours: Optional[float] = None):
                     int(base.get("comment_count") or 0),
                 )
             )
-            if article_html:
+            if html_is_meaningful:
                 article.source_html = article_html
             article.last_seen_at = now
             affected += 1
@@ -1044,13 +1220,14 @@ def upsert_articles(items: List[Dict], max_hours: Optional[float] = None):
             logger.exception("upsert failed article_id=%s err=%s", article_id, exc)
     _commit_with_retry()
     logger.info(
-        "upsert summary total=%s affected=%s created=%s updated=%s skip_time=%s skip_fans=%s empty_html=%s skip_empty_create=%s errors=%s",
+        "upsert summary total=%s affected=%s created=%s updated=%s skip_time=%s skip_fans=%s skip_views=%s empty_html=%s skip_empty_create=%s errors=%s",
         stats["total_candidates"],
         affected,
         stats["created"],
         stats["updated"],
         stats["skip_time"],
         stats["skip_fans"],
+        stats["skip_views"],
         stats["empty_html"],
         stats["skip_empty_html_create"],
         stats["errors"],
@@ -1058,7 +1235,7 @@ def upsert_articles(items: List[Dict], max_hours: Optional[float] = None):
     return affected
 
 
-def collect_authors_from_recommend():
+def collect_authors_from_recommend(return_stats: bool = False):
     logger.info("author collect job started")
     now = cn_now_naive()
     max_fans = int(current_app.config["CRAWL_MAX_FANS"])
@@ -1092,7 +1269,7 @@ def collect_authors_from_recommend():
         for base in author_map.values():
             try:
                 fans = crawler._get_author_fans_count(base["author_url"])
-                if fans >= max_fans:
+                if fans <= 0 or fans >= max_fans:
                     skipped += 1
                     continue
                 row = existing_map.get(base["author_url"])
@@ -1134,91 +1311,129 @@ def collect_authors_from_recommend():
         )
     finally:
         crawler.close()
+    if return_stats:
+        return {
+            "created": int(created),
+            "updated": int(updated),
+            "skipped": int(skipped),
+            "errors": int(errors),
+        }
     return created + updated
 
 
-def crawl_from_author_pool():
+def crawl_from_author_pool(run_until_exhausted: Optional[bool] = None):
     logger.info("author articles job started")
     now = cn_now_naive()
     max_hours = float(current_app.config.get("AUTHOR_ARTICLE_MAX_HOURS", 24))
     batch_size = int(current_app.config.get("AUTHOR_CRAWL_BATCH_SIZE", 20))
     per_author_limit = int(current_app.config.get("AUTHOR_PER_AUTHOR_TARGET_COUNT", 20))
     max_fails = int(current_app.config.get("AUTHOR_MAX_FAILS", 5))
+    if run_until_exhausted is None:
+        run_until_exhausted = bool(current_app.config.get("AUTHOR_ARTICLES_RUN_UNTIL_EXHAUSTED", True))
     owner = _lease_owner_name()
-    authors = acquire_author_leases(batch_size)
-    if not authors:
-        logger.info("author articles job skipped: no leasable authors")
-        return 0
-
-    crawler = ToutiaoCrawler(headless=current_app.config["CRAWL_HEADLESS"])
+    crawler = None
     total_changed = 0
+    total_authors = 0
+    lease_rounds = 0
     try:
-        for author in authors:
-            author_id = int(author.id)
-            author_url = author.author_url
-            author_name = author.author_name
-            author_followers = int(author.followers or 0)
-            try:
-                items = crawler.crawl_author_recent_articles(
-                    author_url=author_url,
-                    author_name=author_name,
-                    max_items=per_author_limit,
-                )
-                if items:
-                    for item in items:
-                        item["followers"] = author_followers
-                    changed = upsert_articles(items, max_hours=max_hours)
-                    total_changed += int(changed)
+        while True:
+            authors = acquire_author_leases(batch_size)
+            if not authors:
+                if lease_rounds == 0:
+                    logger.info("author articles job skipped: no leasable authors")
+                break
+            lease_rounds += 1
+            total_authors += len(authors)
 
-                # 单作者状态更新独立提交，减少长事务锁竞争
-                now_local = cn_now_naive()
-                AuthorSource.query.filter(
-                    AuthorSource.id == author_id, AuthorSource.lease_owner == owner
-                ).update(
-                    {
-                        AuthorSource.last_crawled_at: now_local,
-                        AuthorSource.fail_count: 0,
-                        AuthorSource.last_error: "",
-                        AuthorSource.lease_owner: "",
-                        AuthorSource.lease_until: None,
-                    },
-                    synchronize_session=False,
-                )
-                _commit_with_retry()
-            except Exception as exc:
-                # 先回滚坏事务，避免 PendingRollbackError 连锁
-                db.session.rollback()
+            if crawler is None:
+                crawler = ToutiaoCrawler(headless=current_app.config["CRAWL_HEADLESS"])
+
+            for author in authors:
+                author_id = int(author.id)
+                author_url = author.author_url
+                author_name = author.author_name
+                author_followers = int(author.followers or 0)
+                row = None
                 try:
-                    row = AuthorSource.query.filter(AuthorSource.id == author_id).first()
-                    if row:
-                        row.fail_count = int(row.fail_count or 0) + 1
-                        row.last_error = str(exc)[:500]
-                        if row.fail_count >= max_fails:
-                            row.status = "invalid"
-                        row.lease_owner = ""
-                        row.lease_until = None
-                        _commit_with_retry()
-                except Exception as update_exc:
-                    db.session.rollback()
-                    logger.warning(
-                        "author crawl status update failed author=%s err=%s",
+                    logger.info(
+                        "author articles processing author_id=%s author=%s followers=%s",
+                        author_id,
                         author_url,
-                        update_exc,
+                        author_followers,
                     )
-                logger.warning(
-                    "author crawl failed author=%s fail_count=%s err=%s",
-                    author_url,
-                    (row.fail_count if "row" in locals() and row else "n/a"),
-                    exc,
-                )
+                    items = crawler.crawl_author_recent_articles(
+                        author_url=author_url,
+                        author_name=author_name,
+                        max_items=per_author_limit,
+                    )
+                    logger.info(
+                        "author articles fetched author_id=%s items=%s",
+                        author_id,
+                        len(items),
+                    )
+                    if items:
+                        for item in items:
+                            item["followers"] = author_followers
+                        min_views = int(current_app.config.get("AUTHOR_ARTICLE_MIN_VIEWS", 2000))
+                        changed = upsert_articles(items, max_hours=max_hours, min_views=min_views)
+                        total_changed += int(changed)
+                    else:
+                        logger.info("author articles empty author_id=%s reason=no_recent_items", author_id)
+
+                    # 单作者状态更新独立提交，减少长事务锁竞争
+                    now_local = cn_now_naive()
+                    AuthorSource.query.filter(
+                        AuthorSource.id == author_id, AuthorSource.lease_owner == owner
+                    ).update(
+                        {
+                            AuthorSource.last_crawled_at: now_local,
+                            AuthorSource.fail_count: 0,
+                            AuthorSource.last_error: "",
+                            AuthorSource.lease_owner: "",
+                            AuthorSource.lease_until: None,
+                        },
+                        synchronize_session=False,
+                    )
+                    _commit_with_retry()
+                except Exception as exc:
+                    # 先回滚坏事务，避免 PendingRollbackError 连锁
+                    db.session.rollback()
+                    try:
+                        row = AuthorSource.query.filter(AuthorSource.id == author_id).first()
+                        if row:
+                            row.fail_count = int(row.fail_count or 0) + 1
+                            row.last_error = str(exc)[:500]
+                            if row.fail_count >= max_fails:
+                                row.status = "invalid"
+                            row.lease_owner = ""
+                            row.lease_until = None
+                            _commit_with_retry()
+                    except Exception as update_exc:
+                        db.session.rollback()
+                        logger.warning(
+                            "author crawl status update failed author=%s err=%s",
+                            author_url,
+                            update_exc,
+                        )
+                    logger.warning(
+                        "author crawl failed author=%s fail_count=%s err=%s",
+                        author_url,
+                        (row.fail_count if "row" in locals() and row else "n/a"),
+                        exc,
+                    )
+            if not run_until_exhausted:
+                break
     finally:
-        crawler.close()
+        if crawler:
+            crawler.close()
     logger.info(
-        "author articles summary owner=%s processed_authors=%s changed_articles=%s max_hours=%s elapsed_seconds=%.2f",
+        "author articles summary owner=%s rounds=%s processed_authors=%s changed_articles=%s max_hours=%s run_until_exhausted=%s elapsed_seconds=%.2f",
         owner,
-        len(authors),
+        lease_rounds,
+        total_authors,
         total_changed,
         max_hours,
+        run_until_exhausted,
         (cn_now_naive() - now).total_seconds(),
     )
     return total_changed
@@ -1233,11 +1448,54 @@ def run_crawl_job():
 
 
 def run_author_collect_job():
-    collect_authors_from_recommend()
+    stats = collect_authors_from_recommend(return_stats=True)
+    continuous_enabled = bool(current_app.config.get("AUTHOR_ARTICLES_CONTINUOUS_ENABLED", True))
+    trigger_articles = bool(current_app.config.get("AUTHOR_TRIGGER_ARTICLES_ON_COLLECT", True))
+    created_count = int(stats.get("created", 0))
+    if (not continuous_enabled) and trigger_articles and created_count > 0:
+        logger.info("author collect detected new authors=%s, trigger articles crawl", created_count)
+        run_author_articles_job()
+    return int(stats.get("created", 0)) + int(stats.get("updated", 0))
 
 
 def run_author_articles_job():
-    crawl_from_author_pool()
+    if not _AUTHOR_ARTICLES_JOB_LOCK.acquire(blocking=False):
+        logger.info("author articles job skipped: another run is in progress")
+        return 0
+    try:
+        return crawl_from_author_pool()
+    finally:
+        _AUTHOR_ARTICLES_JOB_LOCK.release()
+
+
+def run_author_articles_loop():
+    idle_sleep = max(5, int(current_app.config.get("AUTHOR_ARTICLES_IDLE_SLEEP_SECONDS", 30)))
+    logger.info("author articles loop started idle_sleep=%ss", idle_sleep)
+    while True:
+        batch_size = int(current_app.config.get("AUTHOR_CRAWL_BATCH_SIZE", 20))
+        now = cn_now_naive()
+        recrawl_interval_hours = float(current_app.config.get("AUTHOR_RECRAWL_INTERVAL_HOURS", 5))
+        earliest_next_crawl_at = now - timedelta(hours=max(0.0, recrawl_interval_hours))
+        leasable_count = AuthorSource.query.filter(
+            AuthorSource.status == "active",
+            AuthorSource.followers > 0,
+            or_(AuthorSource.last_crawled_at.is_(None), AuthorSource.last_crawled_at <= earliest_next_crawl_at),
+            or_(AuthorSource.lease_until.is_(None), AuthorSource.lease_until < now),
+        ).count()
+        logger.info(
+            "author articles loop tick leasable_authors=%s batch_size=%s recrawl_hours=%s",
+            leasable_count,
+            batch_size,
+            recrawl_interval_hours,
+        )
+        changed = run_author_articles_job()
+        if int(changed or 0) > 0:
+            continue
+        if leasable_count <= 0:
+            logger.info("author articles loop idle: no leasable authors, sleep=%ss", idle_sleep)
+        else:
+            logger.info("author articles loop idle: no article changed this round, sleep=%ss", idle_sleep)
+        time.sleep(idle_sleep)
 
 
 def cleanup_expired_articles():

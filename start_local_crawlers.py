@@ -16,7 +16,13 @@ def stream_output(prefix: str, pipe):
         for line in iter(pipe.readline, ""):
             if not line:
                 break
-            print(f"[{prefix}] {line.rstrip()}")
+            text = f"[{prefix}] {line.rstrip()}"
+            try:
+                print(text)
+            except UnicodeEncodeError:
+                # Windows 控制台常见 GBK 编码，遇到异常字符时降级替换，避免日志线程退出
+                fallback = text.encode("gbk", errors="replace").decode("gbk", errors="replace")
+                print(fallback)
     finally:
         pipe.close()
 

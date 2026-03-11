@@ -126,20 +126,51 @@ def _ensure_valid_source_content(url: str, html: str, text: str):
         raise ValueError("未能抓取到有效原文内容，请检查文章链接是否正确")
 
 
+def _count_source_paragraphs(source_html: str, source_text: str) -> int:
+    soup = BeautifulSoup(source_html or "", "html.parser")
+    blocks = [
+        node.get_text(" ", strip=True)
+        for node in soup.find_all(["p", "h1", "h2", "h3", "h4", "li"])
+        if node.get_text(" ", strip=True)
+    ]
+    if blocks:
+        return len(blocks)
+    text_lines = [line.strip() for line in (source_text or "").splitlines() if line.strip()]
+    return len(text_lines)
+
+
 def _rewrite_text(original_title: str, source_text: str, source_html: str):
     source_text = source_text[:3000]
     api_key = current_app.config["DEEPSEEK_API_KEY"]
     if api_key:
         image_guidance = _build_image_guidance(source_html)
+        paragraph_count = _count_source_paragraphs(source_html, source_text)
+        image_count = len(_extract_source_image_points(BeautifulSoup(source_html or "", "html.parser"))[0])
+        if paragraph_count < 7:
+            paragraph_rule = (
+                f"原文约 {paragraph_count} 段，改写后必须扩写到至少 7 段（建议 7-9 段），"
+                "保证层次更清晰。"
+            )
+        else:
+            paragraph_rule = (
+                f"原文约 {paragraph_count} 段，改写后段落数必须接近原文，允许误差 ±2 段。"
+            )
         prompt = (
-            "请将下面文章改写成口语化、可读性强的中文内容。\n"
+            "你将收到一篇中文原文，请把它改写成高可读、强传播、强原创的版本。\n"
             "严格只输出 JSON（不要 markdown 代码块）："
             '{"rewrittenBodyHtml":"<p>...</p>","suggestedTitles":["标题1","标题2","标题3"]}\n'
             "要求：\n"
-            "1) rewrittenBodyHtml 只放正文，不要包含“标题建议”等段落。\n"
-            "2) 必须在 rewrittenBodyHtml 中插入原文图片，使用 <img src=\"...\">。\n"
-            "3) 图片 src 必须完全使用提供的原图 URL，不要改写、不要省略、不要替换。\n"
-            "4) 按原文图片出现位置，插入到改写正文对应段落位置。\n"
+            "1) rewrittenBodyHtml 只放正文，不要包含“标题建议”等说明文字。\n"
+            "2) 原创度必须非常高：通过乱序、插叙、倒叙、换人称、同义替换、句式重组、补充细节等方式重写，"
+            "与原文相似度必须低于 10%。\n"
+            "3) 语言必须口语化、接地气，去掉 AI 腔；避免“与此同时、此外、综上所述、然而”等模板连接词。\n"
+            f"4) {paragraph_rule}\n"
+            f"5) 原文图片总数为 {image_count} 张。改写结果必须保留全部图片，数量必须完全一致，不允许减少。\n"
+            "6) 必须在 rewrittenBodyHtml 中使用 <img src=\"...\"> 插图，且 src 必须完全使用给定原图 URL，"
+            "不要改写、不要替换、不要省略。\n"
+            "7) 图片应尽量按原文位置对应插入到改写正文。\n"
+            "8) suggestedTitles 提供 3 个中文标题，单个标题建议控制在 24-30 个中文字符，风格有吸引力但不过度夸张。\n"
+            "9) 改写内容必须完整通顺、无明显语病和错别字。\n"
             f"{image_guidance}\n"
             f"原标题：{original_title}\n"
             f"原文：{source_text}"
@@ -148,7 +179,14 @@ def _rewrite_text(original_title: str, source_text: str, source_html: str):
         payload = {
             "model": current_app.config["DEEPSEEK_MODEL"],
             "messages": [
-                {"role": "system", "content": "你是资深新媒体编辑。"},
+                {
+                    "role": "system",
+                    "content": (
+                        "你是一个干了十年的爆文编辑，擅长把普通文章改成高传播、高互动的内容。"
+                        "你写作风格口语化、短句、有人味，能明显降低与原文相似度。"
+                        "你必须严格遵守用户给出的结构约束，并且只输出合法 JSON。"
+                    ),
+                },
                 {"role": "user", "content": prompt},
             ],
             "temperature": 0.8,
@@ -325,11 +363,18 @@ def _build_image_guidance(source_html: str) -> str:
     img_points, _ = _extract_source_image_points(source)
     if not img_points:
         return "原文无图片，可不插图。"
-    lines = ["原文图片清单（按出现顺序）："]
+    total = len(img_points)
+    lines = [
+        f"原文图片清单（共 {total} 张）：",
+        "以下所有图片必须全部出现在改写结果中，数量必须与原文完全一致，不允许减少。",
+        "请按出现顺序和相对段落位置进行插入：",
+    ]
     for idx, (para_idx, src) in enumerate(img_points, start=1):
         lines.append(f"{idx}. 段落索引={para_idx}, src={src}")
         if idx >= 10:
             break
+    if total > 10:
+        lines.append(f"...（还有 {total - 10} 张图片，同样必须保留）")
     return "\n".join(lines)
 
 

@@ -137,8 +137,6 @@ def export_articles():
             "评论数",
             "发布时间文本",
             "发布时间(小时前)",
-            "封面",
-            "原文HTML",
         ]
     )
 
@@ -158,8 +156,6 @@ def export_articles():
                 int(row.comment_count or 0),
                 row.publish_time_text or "",
                 round(float(hours_ago or 0), 2),
-                row.cover or "",
-                row.source_html or "",
             ]
         )
 
