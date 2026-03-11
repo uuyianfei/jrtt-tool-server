@@ -999,13 +999,20 @@ class ToutiaoCrawler:
         return results
 
 
-def upsert_articles(items: List[Dict], max_hours: Optional[float] = None, min_views: int = 0):
+def upsert_articles(
+    items: List[Dict],
+    max_hours: Optional[float] = None,
+    min_views: int = 0,
+    shared_crawler: "Optional[ToutiaoCrawler]" = None,
+):
     now = cn_now_naive()
     app = current_app._get_current_object()
     max_hours = float(max_hours if max_hours is not None else current_app.config["CRAWL_MAX_HOURS"])
     max_fans = int(current_app.config["CRAWL_MAX_FANS"])
     detail_workers = max(1, int(current_app.config.get("CRAWL_DETAIL_WORKERS", 3)))
     crawl_headless = bool(current_app.config["CRAWL_HEADLESS"])
+    # shared_crawler 只在 detail_workers=1 时生效，复用上层会话避免反复新建浏览器
+    use_shared = shared_crawler is not None and detail_workers == 1
     affected = 0
     stats = {
         "total_candidates": len(items),
@@ -1018,12 +1025,13 @@ def upsert_articles(items: List[Dict], max_hours: Optional[float] = None, min_vi
         "updated": 0,
         "errors": 0,
     }
-    logger.info("detail workers=%s", detail_workers)
+    logger.info("detail workers=%s shared_crawler=%s", detail_workers, use_shared)
 
     def enrich_chunk(chunk: List[Dict]) -> List[Dict]:
         chunk_results: List[Dict] = []
         with app.app_context():
-            crawler = ToutiaoCrawler(headless=crawl_headless)
+            crawler = shared_crawler if use_shared else ToutiaoCrawler(headless=crawl_headless)
+            owned = not use_shared
             try:
                 for base in chunk:
                     article_id = base.get("article_id", "")
@@ -1089,7 +1097,9 @@ def upsert_articles(items: List[Dict], max_hours: Optional[float] = None, min_vi
                             {"status": "error", "article_id": article_id, "error": str(exc)[:300]}
                         )
             finally:
-                crawler.close()
+                # 只有自己创建的 crawler 才负责关闭，shared_crawler 由上层管理
+                if owned:
+                    crawler.close()
         return chunk_results
 
     enrich_results = []
@@ -1396,7 +1406,13 @@ def crawl_from_author_pool(run_until_exhausted: Optional[bool] = None):
                         for item in items:
                             item["followers"] = author_followers
                         min_views = int(current_app.config.get("AUTHOR_ARTICLE_MIN_VIEWS", 2000))
-                        changed = upsert_articles(items, max_hours=max_hours, min_views=min_views)
+                        # CRAWL_DETAIL_WORKERS=1 时复用当前 crawler 会话，避免新建浏览器触发风控
+                        changed = upsert_articles(
+                            items,
+                            max_hours=max_hours,
+                            min_views=min_views,
+                            shared_crawler=crawler,
+                        )
                         total_changed += int(changed)
                     else:
                         logger.info("author articles empty author_id=%s reason=no_recent_items", author_id)
