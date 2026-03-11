@@ -1375,11 +1375,28 @@ def crawl_from_author_pool(run_until_exhausted: Optional[bool] = None):
                 break
             lease_rounds += 1
             total_authors += len(authors)
+            # 当前批次剩余可抓作者数（不含已领取的）
+            now_check = cn_now_naive()
+            recrawl_h = float(current_app.config.get("AUTHOR_RECRAWL_INTERVAL_HOURS", 5))
+            earliest_check = now_check - timedelta(hours=max(0.0, recrawl_h))
+            remaining_count = AuthorSource.query.filter(
+                AuthorSource.status == "active",
+                AuthorSource.followers > 0,
+                or_(AuthorSource.last_crawled_at.is_(None), AuthorSource.last_crawled_at <= earliest_check),
+                or_(AuthorSource.lease_until.is_(None), AuthorSource.lease_until < now_check),
+            ).count()
+            logger.info(
+                "【进度】本轮批次=%s 已处理作者=%s 队列剩余待抓=%s 累计入库文章=%s",
+                len(authors),
+                total_authors,
+                remaining_count,
+                total_changed,
+            )
 
             if crawler is None:
                 crawler = ToutiaoCrawler(headless=current_app.config["CRAWL_HEADLESS"])
 
-            for author in authors:
+            for idx, author in enumerate(authors, start=1):
                 author_id = int(author.id)
                 author_url = author.author_url
                 author_name = author.author_name
@@ -1387,9 +1404,10 @@ def crawl_from_author_pool(run_until_exhausted: Optional[bool] = None):
                 row = None
                 try:
                     logger.info(
-                        "author articles processing author_id=%s author=%s followers=%s",
-                        author_id,
-                        author_url,
+                        "【抓取 %s/%s】作者=%s 粉丝=%s",
+                        idx,
+                        len(authors),
+                        author_name or author_url,
                         author_followers,
                     )
                     items = crawler.crawl_author_recent_articles(
@@ -1520,7 +1538,7 @@ def run_author_articles_loop():
             or_(AuthorSource.lease_until.is_(None), AuthorSource.lease_until < now),
         ).count()
         logger.info(
-            "author articles loop tick leasable_authors=%s batch_size=%s recrawl_hours=%s",
+            "【循环检查】当前可抓作者=%s 批次大小=%s 重抓间隔=%.1f小时",
             leasable_count,
             batch_size,
             recrawl_interval_hours,
@@ -1529,9 +1547,9 @@ def run_author_articles_loop():
         if int(changed or 0) > 0:
             continue
         if leasable_count <= 0:
-            logger.info("author articles loop idle: no leasable authors, sleep=%ss", idle_sleep)
+            logger.info("【空闲等待】当前无可抓作者，休眠 %s 秒后继续检查", idle_sleep)
         else:
-            logger.info("author articles loop idle: no article changed this round, sleep=%ss", idle_sleep)
+            logger.info("【空闲等待】本轮无新文章入库，休眠 %s 秒后继续", idle_sleep)
         time.sleep(idle_sleep)
 
 
