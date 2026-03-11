@@ -72,3 +72,19 @@ services:
       CRAWL_HEADLESS: "false"
       PYTHONUNBUFFERED: "1"
       DISPLAY: ":99"
+
+  import-authors:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: jrtt-import-authors
+    restart: "no"
+    command: ["python", "-u", "import_author_sources.py", "--file", "good_authors.json"]
+    env_file:
+      - .env
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      CHROMEDRIVER_PATH: ${CHROMEDRIVER_PATH:-/usr/bin/chromedriver}
+      CHROME_BINARY_PATH: ${CHROME_BINARY_PATH:-/usr/bin/chromium}
+      CRAWL_HEADLESS: "true"
+      PYTHONUNBUFFERED: "1"
