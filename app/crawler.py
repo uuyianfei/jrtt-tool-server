@@ -953,6 +953,27 @@ class ToutiaoCrawler:
                         publish_time = (tm.group(1) or "").strip()
                         break
                     parent = parent.parent
+
+                cover = ""
+                cover_node = link
+                # 尽量从当前链接附近向上回溯卡片容器，再找封面图片
+                for _ in range(8):
+                    if cover_node is None:
+                        break
+                    img = cover_node.find("img")
+                    if img:
+                        cover = (
+                            img.get("src")
+                            or img.get("data-src")
+                            or img.get("data-original")
+                            or img.get("original-src")
+                            or ""
+                        ).strip()
+                        if cover:
+                            break
+                    cover_node = cover_node.parent
+                if cover.startswith("//"):
+                    cover = f"https:{cover}"
                 found_map[article_id] = {
                     "article_id": article_id,
                     "url": article_url,
@@ -961,7 +982,7 @@ class ToutiaoCrawler:
                     "author_url": author_url,
                     "publish_time": publish_time,
                     "comment_count": 0,
-                    "cover": "",
+                    "cover": cover,
                 }
                 if len(found_map) >= max_items:
                     break
