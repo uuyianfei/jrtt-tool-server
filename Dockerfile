@@ -10,6 +10,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     chromium \
     chromium-driver \
     xvfb \
+    xauth \
     ca-certificates \
     fonts-liberation \
     libnss3 \
