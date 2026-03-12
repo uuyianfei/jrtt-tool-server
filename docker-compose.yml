@@ -79,6 +79,35 @@ services:
       PYTHONUNBUFFERED: "1"
       DISPLAY: ":99"
 
+  recommend-news:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: jrtt-recommend-news
+    restart: unless-stopped
+    command:
+      [
+        "sh",
+        "-lc",
+        "Xvfb :99 -screen 0 1280x720x24 -nolisten tcp & export DISPLAY=:99; exec python -u run_crawler.py",
+      ]
+    env_file:
+      - .env
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      CRAWL_JOB_ENABLED: "true"
+      AUTHOR_COLLECT_JOB_ENABLED: "false"
+      AUTHOR_ARTICLES_JOB_ENABLED: "false"
+      CLEANUP_JOB_ENABLED: "false"
+      WORKER_ROLE: "recommend-news"
+      CHROMEDRIVER_PATH: ${CHROMEDRIVER_PATH:-/usr/bin/chromedriver}
+      CHROME_BINARY_PATH: ${CHROME_BINARY_PATH:-/usr/bin/chromium}
+      CRAWL_HEADLESS: "false"
+      # 推荐流抓取间隔（秒）
+      CRAWL_INTERVAL_SECONDS: ${CRAWL_INTERVAL_SECONDS:-120}
+      PYTHONUNBUFFERED: "1"
+      DISPLAY: ":99"
+
   # import-authors:
   #   build:
   #     context: .
