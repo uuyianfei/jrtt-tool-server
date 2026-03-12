@@ -619,10 +619,15 @@ class ToutiaoCrawler:
             "title": "",
             "publish_time_text": "",
             "published_at": None,
+            "final_url": "",
         }
         try:
             article_url = normalize_article_url(article_url)
             self._safe_get(article_url)
+            try:
+                detail["final_url"] = normalize_article_url(self.driver.current_url or "")
+            except Exception:
+                detail["final_url"] = ""
             self._safe_execute_script("window.scrollTo(0, 0);")
             ready_timeout = max(6, int(current_app.config.get("DETAIL_PAGE_READY_TIMEOUT_SECONDS", 12)))
             try:

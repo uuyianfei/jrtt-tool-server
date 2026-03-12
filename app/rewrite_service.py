@@ -1,17 +1,25 @@
 import json
+import logging
 import re
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+from urllib.parse import urlsplit
 
 import requests
 from bs4 import BeautifulSoup
 from flask import current_app
+from sqlalchemy import or_
 
-from .crawler import ToutiaoCrawler
+from .crawler import ToutiaoCrawler, normalize_article_url
 from .extensions import db
 from .models import Article, RewriteTask
 from .time_utils import cn_now_naive
+from .utils import sha256_hex
+
+
+logger = logging.getLogger(__name__)
 
 
 def new_task_id() -> str:
@@ -32,8 +40,15 @@ def _rewrite_worker(app, task_id: str):
         if not task:
             return
         try:
+            fetch_timeout = max(10, int(current_app.config.get("REWRITE_FETCH_TIMEOUT_SECONDS", 45)))
+            ai_timeout = max(30, int(current_app.config.get("REWRITE_AI_TIMEOUT_SECONDS", 180)))
             _update_task(task, 10, "正在获取原文内容...", 7)
-            source_html, source_title, source_text = _fetch_source(task.url)
+            source_html, source_title, source_text = _run_with_timeout(
+                _fetch_source,
+                timeout_seconds=fetch_timeout,
+                stage="fetch_source",
+                url=task.url,
+            )
             task.source_html = source_html
             db.session.commit()
 
@@ -41,7 +56,14 @@ def _rewrite_worker(app, task_id: str):
             time.sleep(1)
             _update_task(task, 70, "AI 正在深度改写中...", 3)
 
-            rewritten_html, suggested_titles = _rewrite_text(source_title, source_text, source_html)
+            rewritten_html, suggested_titles = _run_with_timeout(
+                _rewrite_text,
+                timeout_seconds=ai_timeout,
+                stage="rewrite_ai",
+                original_title=source_title,
+                source_text=source_text,
+                source_html=source_html,
+            )
             rewritten_html, suggested_titles = _post_process_rewrite_output(
                 rewritten_html, suggested_titles, source_title
             )
@@ -59,8 +81,15 @@ def _rewrite_worker(app, task_id: str):
             task.completed_at = cn_now_naive()
             db.session.commit()
         except Exception as exc:
-            task.error_message = str(exc)
-            db.session.commit()
+            db.session.rollback()
+            latest = RewriteTask.query.filter_by(task_id=task_id).first()
+            if latest:
+                latest.error_message = str(exc)[:500]
+                latest.status_text = "改写失败"
+                latest.time_remaining = 0
+                latest.progress = max(int(latest.progress or 0), 1)
+                db.session.commit()
+            logger.warning("rewrite task failed task_id=%s err=%s", task_id, exc)
 
 
 def _update_task(task: RewriteTask, progress: int, text: str, remain: int):
@@ -71,18 +100,33 @@ def _update_task(task: RewriteTask, progress: int, text: str, remain: int):
 
 
 def _fetch_source(url: str):
-    article = Article.query.filter_by(url=url).first()
+    raw_url = (url or "").strip()
+    resolved_url = _resolve_toutiao_short_url(raw_url)
+    normalized_url = normalize_article_url(resolved_url or raw_url)
+    conditions = [Article.url == raw_url]
+    if resolved_url and resolved_url != raw_url:
+        conditions.append(Article.url == resolved_url)
+    if normalized_url and normalized_url != raw_url:
+        conditions.append(Article.url == normalized_url)
+    if normalized_url:
+        conditions.append(Article.url_hash == sha256_hex(normalized_url))
+    article = Article.query.filter(or_(*conditions)).order_by(Article.updated_at.desc()).first()
     if article and article.source_html:
         title = article.title or "原标题"
         html = _sanitize_image_inline_styles(article.source_html)
         text = _html_to_text(html)
-        _ensure_valid_source_content(url, html, text)
+        _ensure_valid_source_content(normalized_url or raw_url, html, text)
         return html, title, text
 
     # 未命中数据库时，改为使用 Selenium 爬虫抓取原文（与爬虫 job 同源）
-    crawler = ToutiaoCrawler(headless=current_app.config.get("CRAWL_HEADLESS", True))
+    # 先做 URL 兜底校验，避免无效链接触发浏览器抓取卡顿
+    if not _is_supported_toutiao_url(normalized_url):
+        raise ValueError("仅支持头条文章链接（www.toutiao.com/article/... 或 m.toutiao.com/is/...）")
+
+    # rewrite 走 API 服务，不依赖 Xvfb，固定使用 headless 以避免显示环境导致阻塞
+    crawler = ToutiaoCrawler(headless=True)
     try:
-        details = crawler._get_article_details(url)
+        details = crawler._get_article_details(normalized_url)
     finally:
         crawler.close()
 
@@ -95,9 +139,69 @@ def _fetch_source(url: str):
     if not title:
         title = "原标题"
 
+    final_url = normalize_article_url(details.get("final_url") or "")
     text = _html_to_text(html)
-    _ensure_valid_source_content(url, html, text)
+    _ensure_valid_source_content(final_url or normalized_url, html, text)
     return html, title, text
+
+
+def _run_with_timeout(func, timeout_seconds: int, stage: str, **kwargs):
+    executor = ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(func, **kwargs)
+    try:
+        return future.result(timeout=timeout_seconds)
+    except FuturesTimeoutError:
+        future.cancel()
+        raise TimeoutError(f"{stage} timeout after {timeout_seconds}s")
+    finally:
+        # 不等待超时线程自然结束，避免阻塞当前改写任务状态回写
+        executor.shutdown(wait=False, cancel_futures=True)
+
+
+def _is_supported_toutiao_url(url: str) -> bool:
+    text = (url or "").strip()
+    if not text:
+        return False
+    return bool(
+        re.search(r"^https?://(?:www\.)?toutiao\.com/article/\d+/?", text)
+        or re.search(r"^https?://m\.toutiao\.com/is/[A-Za-z0-9]+/?", text)
+    )
+
+
+def _resolve_toutiao_short_url(url: str) -> str:
+    """
+    解析 m.toutiao.com/is/... 短链，拿到最终 article 链接。
+    解析失败时返回原始 URL，不阻断后续 Selenium 跳转识别。
+    """
+    raw = (url or "").strip()
+    if not raw:
+        return raw
+    try:
+        parts = urlsplit(raw)
+        is_mobile_short = (
+            parts.scheme in {"http", "https"}
+            and (parts.netloc or "").lower() == "m.toutiao.com"
+            and (parts.path or "").startswith("/is/")
+        )
+        if not is_mobile_short:
+            return raw
+        resp = requests.get(
+            raw,
+            allow_redirects=True,
+            timeout=12,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Linux; Android 13; Mobile) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+                )
+            },
+        )
+        final_url = (resp.url or "").strip()
+        if final_url:
+            return final_url
+    except Exception as exc:
+        logger.info("resolve toutiao short url failed url=%s err=%s", raw, exc)
+    return raw
 
 
 def _html_to_text(html: str) -> str:
