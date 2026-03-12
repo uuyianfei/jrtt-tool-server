@@ -573,6 +573,42 @@ class ToutiaoCrawler:
         """
         WebDriverWait(self.driver, timeout_seconds).until(lambda d: bool(d.execute_script(js)))
 
+    def _materialize_lazy_images(self):
+        """
+        触发详情页懒加载图片，尽量拿到完整正文 DOM。
+        """
+        try:
+            rounds = max(1, int(current_app.config.get("DETAIL_IMAGE_SCROLL_ROUNDS", 4)))
+        except Exception:
+            rounds = 4
+        try:
+            for _ in range(rounds):
+                self._safe_execute_script("window.scrollBy(0, Math.max(600, window.innerHeight));")
+                time.sleep(0.35)
+            self._safe_execute_script("window.scrollTo(0, document.body.scrollHeight);")
+            time.sleep(0.6)
+            self._safe_execute_script("window.scrollTo(0, 0);")
+            time.sleep(0.25)
+        except Exception as exc:
+            logger.debug("materialize lazy images skipped: %s", exc)
+
+    def _count_images_in_html(self, article_html: str) -> int:
+        if not article_html:
+            return 0
+        soup = BeautifulSoup(article_html, "html.parser")
+        cnt = 0
+        for img in soup.find_all("img"):
+            src = (
+                img.get("src")
+                or img.get("data-src")
+                or img.get("data-original")
+                or img.get("original-src")
+                or ""
+            ).strip()
+            if src:
+                cnt += 1
+        return cnt
+
     def _extract_article_html_from_scripts(self, soup: BeautifulSoup, html_text: str) -> str:
         # JSON-LD 正文
         for script in soup.find_all("script", attrs={"type": "application/ld+json"}):
@@ -635,6 +671,8 @@ class ToutiaoCrawler:
             except TimeoutException:
                 # 页面结构不稳定时继续走兜底解析，不中断流程
                 time.sleep(1.0)
+            # 触发懒加载图片，避免只拿到首屏图片
+            self._materialize_lazy_images()
             html = self._safe_page_source()
             soup = BeautifulSoup(html, "html.parser")
 
@@ -688,6 +726,11 @@ class ToutiaoCrawler:
             container = self._extract_article_container(soup)
             if container:
                 detail["article_html"] = str(container)
+                logger.info(
+                    "article container extracted url=%s images=%s",
+                    article_url,
+                    self._count_images_in_html(detail["article_html"]),
+                )
             else:
                 fallback_html = self._extract_article_html_from_scripts(soup, html)
                 if fallback_html:
@@ -703,6 +746,7 @@ class ToutiaoCrawler:
                     self._wait_article_ready(timeout_seconds=max(6, ready_timeout - 2))
                 except Exception:
                     time.sleep(0.8)
+                self._materialize_lazy_images()
                 html_retry = self._safe_page_source()
                 soup_retry = BeautifulSoup(html_retry, "html.parser")
                 container_retry = self._extract_article_container(soup_retry)
@@ -710,7 +754,11 @@ class ToutiaoCrawler:
                     retry_html = str(container_retry)
                     if self._is_meaningful_article_html(retry_html):
                         detail["article_html"] = retry_html
-                        logger.info("article html extracted via retry url=%s", article_url)
+                        logger.info(
+                            "article html extracted via retry url=%s images=%s",
+                            article_url,
+                            self._count_images_in_html(detail["article_html"]),
+                        )
                 if not self._is_meaningful_article_html(detail.get("article_html", "")):
                     fallback_retry = self._extract_article_html_from_scripts(soup_retry, html_retry)
                     if fallback_retry:
@@ -821,17 +869,9 @@ class ToutiaoCrawler:
                     )
 
                 for link in links:
-                    parent = link
-                    for _ in range(12):
-                        if parent is None:
-                            break
-                        read_div = parent.find("div", class_="profile-feed-card-tools-text")
-                        if read_div:
-                            read_text = read_div.get_text(strip=True)
-                            m = re.search(r"(\d+(?:\.\d+)?)([万亿]?)\s*阅读", read_text)
-                            if m:
-                                return parse_number((m.group(1) or "") + (m.group(2) or ""))
-                        parent = parent.parent
+                    read_count = self._extract_read_count_from_link_context(link)
+                    if read_count > 0:
+                        return read_count
 
                 # 没找到就继续下拉加载更多
                 self._safe_execute_script("window.scrollTo(0, document.body.scrollHeight);")
@@ -840,27 +880,57 @@ class ToutiaoCrawler:
             logger.warning("get read count from author failed: %s", exc)
         return 0
 
+    def _extract_read_count_from_link_context(self, link) -> int:
+        if link is None:
+            return 0
+        parent = link
+        for _ in range(12):
+            if parent is None:
+                break
+            read_div = parent.find("div", class_="profile-feed-card-tools-text")
+            if read_div:
+                read_text = read_div.get_text(" ", strip=True)
+                m = re.search(r"(\d+(?:\.\d+)?)([万亿]?)\s*阅读", read_text)
+                if m:
+                    return parse_number((m.group(1) or "") + (m.group(2) or ""))
+                by_keyword = self._extract_count_by_keyword(read_text, "阅读")
+                if by_keyword > 0:
+                    return by_keyword
+            parent = parent.parent
+        return 0
+
     def crawl_recommend_page(self, target_count: int) -> List[Dict]:
         url = current_app.config["TOUTIAO_URL"]
         scroll_rounds = int(current_app.config.get("CRAWL_LIST_SCROLL_ROUNDS", 6))
+        initial_wait_seconds = max(0.2, float(current_app.config.get("CRAWL_LIST_INITIAL_WAIT_SECONDS", 1.0)))
+        refresh_wait_seconds = max(0.2, float(current_app.config.get("CRAWL_LIST_REFRESH_WAIT_SECONDS", 1.0)))
+        scroll_wait_seconds = max(0.2, float(current_app.config.get("CRAWL_LIST_SCROLL_WAIT_SECONDS", 0.9)))
+        no_growth_early_stop_rounds = max(
+            0, int(current_app.config.get("CRAWL_LIST_NO_GROWTH_EARLY_STOP_ROUNDS", 2))
+        )
         for attempt in range(2):
             try:
                 self._safe_get(url)
-                time.sleep(2)
+                time.sleep(initial_wait_seconds)
                 self._safe_refresh()
                 # refresh 失败后，至少保证重新打开一次页面
                 self._safe_get(url)
-                time.sleep(2)
+                time.sleep(refresh_wait_seconds)
                 found_map = {}
                 last_card_count = 0
+                no_growth_rounds = 0
                 for round_idx in range(1, scroll_rounds + 1):
                     self._safe_execute_script("window.scrollTo(0, document.body.scrollHeight);")
-                    time.sleep(1.2)
+                    time.sleep(scroll_wait_seconds)
                     soup = BeautifulSoup(self._safe_page_source(), "html.parser")
                     cards = self._find_article_cards(soup)
                     current_card_count = len(cards)
                     new_card_delta = max(0, current_card_count - last_card_count)
                     last_card_count = current_card_count
+                    if new_card_delta <= 0:
+                        no_growth_rounds += 1
+                    else:
+                        no_growth_rounds = 0
 
                     for card in cards:
                         info = self._extract_article_info(card)
@@ -871,14 +941,23 @@ class ToutiaoCrawler:
                             break
 
                     logger.info(
-                        "crawl list round=%s/%s cards=%s new_cards=%s selected=%s",
+                        "crawl list round=%s/%s cards=%s new_cards=%s selected=%s no_growth_rounds=%s",
                         round_idx,
                         scroll_rounds,
                         current_card_count,
                         new_card_delta,
                         len(found_map),
+                        no_growth_rounds,
                     )
                     if len(found_map) >= target_count:
+                        break
+                    if no_growth_early_stop_rounds > 0 and no_growth_rounds >= no_growth_early_stop_rounds:
+                        logger.info(
+                            "crawl list early stop round=%s reason=no_growth rounds=%s selected=%s",
+                            round_idx,
+                            no_growth_rounds,
+                            len(found_map),
+                        )
                         break
 
                 found = list(found_map.values())[:target_count]
@@ -970,6 +1049,7 @@ class ToutiaoCrawler:
                     parent = parent.parent
 
                 cover = ""
+                read_count = self._extract_read_count_from_link_context(link)
                 # 先直接看当前链接内部是否有 img（封面 <a> 内嵌图片）
                 direct_img = link.find("img")
                 if direct_img:
@@ -1001,6 +1081,13 @@ class ToutiaoCrawler:
                         card = card.parent
                 if cover.startswith("//"):
                     cover = f"https:{cover}"
+                existing = found_map.get(article_id, {})
+                if not title:
+                    title = (existing.get("title") or "").strip()
+                if not publish_time:
+                    publish_time = (existing.get("publish_time") or "").strip()
+                if not cover:
+                    cover = (existing.get("cover") or "").strip()
                 found_map[article_id] = {
                     "article_id": article_id,
                     "url": article_url,
@@ -1010,6 +1097,7 @@ class ToutiaoCrawler:
                     "publish_time": publish_time,
                     "comment_count": 0,
                     "cover": cover,
+                    "read_count": int(max(int(read_count or 0), int(existing.get("read_count") or 0))),
                 }
                 if len(found_map) >= max_items:
                     break
@@ -1080,6 +1168,23 @@ def upsert_articles(
                             )
                             continue
 
+                        read_count = int(base.get("read_count") or 0)
+                        read_count_fallback_enabled = bool(
+                            current_app.config.get("AUTHOR_READ_COUNT_FALLBACK_ENABLED", False)
+                        )
+                        if read_count <= 0 and read_count_fallback_enabled:
+                            read_count = crawler._get_article_read_count_from_author(
+                                author_url=base.get("author_url", ""),
+                                article_id=base.get("article_id", ""),
+                                article_title=base.get("title", ""),
+                                article_url=base.get("url", ""),
+                            )
+                        if min_views > 0 and int(read_count or 0) < min_views:
+                            chunk_results.append(
+                                {"status": "skip_views", "article_id": article_id, "views": int(read_count or 0)}
+                            )
+                            continue
+
                         details = crawler._get_article_details(base["url"])
                         detail_published_at = details.get("published_at")
                         hours_ago = list_hours_ago
@@ -1092,17 +1197,6 @@ def upsert_articles(
                                     "article_id": article_id,
                                     "hours_ago": hours_ago,
                                 }
-                            )
-                            continue
-                        read_count = crawler._get_article_read_count_from_author(
-                            author_url=base.get("author_url", ""),
-                            article_id=base.get("article_id", ""),
-                            article_title=base.get("title", ""),
-                            article_url=base.get("url", ""),
-                        )
-                        if min_views > 0 and int(read_count or 0) < min_views:
-                            chunk_results.append(
-                                {"status": "skip_views", "article_id": article_id, "views": int(read_count or 0)}
                             )
                             continue
                         chunk_results.append(
@@ -1295,10 +1389,12 @@ def upsert_articles(
 
 def collect_authors_from_recommend(return_stats: bool = False):
     logger.info("author collect job started")
+    app_obj = current_app._get_current_object()
     now = cn_now_naive()
     max_fans = int(current_app.config["CRAWL_MAX_FANS"])
     target_count = int(current_app.config.get("AUTHOR_COLLECT_TARGET_COUNT", current_app.config["CRAWL_TARGET_COUNT"]))
     commit_batch_size = max(1, int(current_app.config.get("AUTHOR_COLLECT_COMMIT_BATCH_SIZE", 50)))
+    fans_workers = max(1, int(current_app.config.get("AUTHOR_COLLECT_FANS_WORKERS", 1)))
     crawler = ToutiaoCrawler(headless=current_app.config["CRAWL_HEADLESS"])
     created = 0
     updated = 0
@@ -1323,22 +1419,85 @@ def collect_authors_from_recommend(return_stats: bool = False):
             existing_rows = AuthorSource.query.filter(AuthorSource.author_url.in_(author_urls)).all()
         existing_map = {row.author_url: row for row in existing_rows}
 
+        probe_started = time.perf_counter()
+        fans_probe_map: Dict[str, Dict] = {}
+
+        def probe_fans_chunk(chunk: List[Dict]) -> List[Dict]:
+            chunk_results: List[Dict] = []
+            with app_obj.app_context():
+                local_crawler = ToutiaoCrawler(headless=current_app.config["CRAWL_HEADLESS"])
+                try:
+                    for base in chunk:
+                        author_url = base.get("author_url", "")
+                        try:
+                            fans = int(local_crawler._get_author_fans_count(author_url) or 0)
+                            chunk_results.append({"author_url": author_url, "fans": fans, "error": ""})
+                        except Exception as exc:
+                            chunk_results.append(
+                                {"author_url": author_url, "fans": 0, "error": str(exc)[:300]}
+                            )
+                finally:
+                    local_crawler.close()
+            return chunk_results
+
+        author_bases = list(author_map.values())
+        if fans_workers <= 1 or len(author_bases) <= 1:
+            for base in author_bases:
+                author_url = base.get("author_url", "")
+                try:
+                    fans_probe_map[author_url] = {
+                        "author_url": author_url,
+                        "fans": int(crawler._get_author_fans_count(author_url) or 0),
+                        "error": "",
+                    }
+                except Exception as exc:
+                    fans_probe_map[author_url] = {
+                        "author_url": author_url,
+                        "fans": 0,
+                        "error": str(exc)[:300],
+                    }
+        else:
+            chunks = _chunked(author_bases, fans_workers)
+            with ThreadPoolExecutor(max_workers=max(1, len(chunks))) as executor:
+                future_map = {executor.submit(probe_fans_chunk, chunk): chunk for chunk in chunks}
+                for future in as_completed(future_map):
+                    try:
+                        for result in future.result():
+                            fans_probe_map[result.get("author_url", "")] = result
+                    except Exception as exc:
+                        logger.warning("author fans probe chunk failed: %s", exc)
+                        errors += 1
+
+        logger.info(
+            "author fans probe finished authors=%s workers=%s elapsed_seconds=%.2f",
+            len(author_bases),
+            min(fans_workers, max(1, len(author_bases))),
+            max(0.0, time.perf_counter() - probe_started),
+        )
+
         pending_changes = 0
-        for base in author_map.values():
+        for base in author_bases:
             try:
-                fans = crawler._get_author_fans_count(base["author_url"])
+                author_url = base.get("author_url", "")
+                probe = fans_probe_map.get(author_url, {})
+                if probe.get("error"):
+                    errors += 1
+                    logger.warning("author collect fans probe failed author=%s err=%s", author_url, probe.get("error"))
+                    continue
+
+                fans = int(probe.get("fans") or 0)
                 if fans <= 0 or fans >= max_fans:
                     skipped += 1
                     continue
-                row = existing_map.get(base["author_url"])
+                row = existing_map.get(author_url)
                 if row is None:
                     row = AuthorSource(
-                        author_url=base["author_url"],
+                        author_url=author_url,
                         author_name=base.get("author_name", ""),
                         first_seen_at=now,
                     )
                     db.session.add(row)
-                    existing_map[base["author_url"]] = row
+                    existing_map[author_url] = row
                     created += 1
                 else:
                     updated += 1

@@ -1,3 +1,4 @@
+import html
 import json
 import logging
 import re
@@ -67,6 +68,9 @@ def _rewrite_worker(app, task_id: str):
             rewritten_html, suggested_titles = _post_process_rewrite_output(
                 rewritten_html, suggested_titles, source_title
             )
+            if not _is_meaningful_rewrite_html(rewritten_html):
+                logger.warning("rewrite html too short, fallback to source text task_id=%s", task_id)
+                rewritten_html = _build_rewrite_fallback_html(source_html, source_text)
             rewritten_html = _inject_source_images(rewritten_html, source_html)
             time.sleep(1)
             _update_task(task, 95, "正在整理结果...", 1)
@@ -100,7 +104,7 @@ def _update_task(task: RewriteTask, progress: int, text: str, remain: int):
 
 
 def _fetch_source(url: str):
-    raw_url = (url or "").strip()
+    raw_url = _normalize_toutiao_input_url(url)
     resolved_url = _resolve_toutiao_short_url(raw_url)
     normalized_url = normalize_article_url(resolved_url or raw_url)
     conditions = [Article.url == raw_url]
@@ -121,7 +125,7 @@ def _fetch_source(url: str):
     # 未命中数据库时，改为使用 Selenium 爬虫抓取原文（与爬虫 job 同源）
     # 先做 URL 兜底校验，避免无效链接触发浏览器抓取卡顿
     if not _is_supported_toutiao_url(normalized_url):
-        raise ValueError("仅支持头条文章链接（www.toutiao.com/article/... 或 m.toutiao.com/is/...）")
+        raise ValueError("仅支持头条文章链接，请检查链接是否完整可访问")
 
     # rewrite 走 API 服务，不依赖 Xvfb，固定使用 headless 以避免显示环境导致阻塞
     crawler = ToutiaoCrawler(headless=True)
@@ -146,8 +150,14 @@ def _fetch_source(url: str):
 
 
 def _run_with_timeout(func, timeout_seconds: int, stage: str, **kwargs):
+    app = current_app._get_current_object()
+
+    def _run_in_app_context():
+        with app.app_context():
+            return func(**kwargs)
+
     executor = ThreadPoolExecutor(max_workers=1)
-    future = executor.submit(func, **kwargs)
+    future = executor.submit(_run_in_app_context)
     try:
         return future.result(timeout=timeout_seconds)
     except FuturesTimeoutError:
@@ -162,10 +172,21 @@ def _is_supported_toutiao_url(url: str) -> bool:
     text = (url or "").strip()
     if not text:
         return False
-    return bool(
-        re.search(r"^https?://(?:www\.)?toutiao\.com/article/\d+/?", text)
-        or re.search(r"^https?://m\.toutiao\.com/is/[A-Za-z0-9]+/?", text)
-    )
+    try:
+        parts = urlsplit(text)
+        host = (parts.netloc or "").lower()
+        path = parts.path or ""
+        if parts.scheme not in {"http", "https"}:
+            return False
+        # 头条常见文章/短链入口，含移动端短链和 v 短链
+        if re.search(r"^/(?:article/\d+/?|i\d+/?|is/[A-Za-z0-9_-]+/?)", path):
+            return host in {"www.toutiao.com", "m.toutiao.com", "v.toutiao.com", "toutiao.com"}
+        # 兜底：只要是 toutiao 域名下的内容路径，也放行给后续抓取校验
+        if host.endswith("toutiao.com") and path and path != "/":
+            return True
+    except Exception:
+        return False
+    return False
 
 
 def _resolve_toutiao_short_url(url: str) -> str:
@@ -173,14 +194,15 @@ def _resolve_toutiao_short_url(url: str) -> str:
     解析 m.toutiao.com/is/... 短链，拿到最终 article 链接。
     解析失败时返回原始 URL，不阻断后续 Selenium 跳转识别。
     """
-    raw = (url or "").strip()
+    raw = _normalize_toutiao_input_url(url)
     if not raw:
         return raw
     try:
         parts = urlsplit(raw)
+        host = (parts.netloc or "").lower()
         is_mobile_short = (
             parts.scheme in {"http", "https"}
-            and (parts.netloc or "").lower() == "m.toutiao.com"
+            and host in {"m.toutiao.com", "v.toutiao.com"}
             and (parts.path or "").startswith("/is/")
         )
         if not is_mobile_short:
@@ -202,6 +224,20 @@ def _resolve_toutiao_short_url(url: str) -> str:
     except Exception as exc:
         logger.info("resolve toutiao short url failed url=%s err=%s", raw, exc)
     return raw
+
+
+def _normalize_toutiao_input_url(url: str) -> str:
+    text = (url or "").strip().strip("'\"")
+    if not text:
+        return ""
+    if text.startswith("//"):
+        return f"https:{text}"
+    if re.match(r"^[A-Za-z0-9.-]+/is/[A-Za-z0-9_-]+/?$", text):
+        # 兼容用户粘贴 m.toutiao.com/is/xxxxx（无协议）
+        return f"https://{text}"
+    if re.match(r"^(?:m|www|v)\.toutiao\.com/", text):
+        return f"https://{text}"
+    return text
 
 
 def _html_to_text(html: str) -> str:
@@ -455,11 +491,50 @@ def _looks_like_json_fragment(text: str) -> bool:
     t = (text or "").strip()
     if not t:
         return True
+    if t in {"{", "}", "[", "]", "```", "json"}:
+        return True
     if any(k in t for k in ['"rewrittenBodyHtml"', '"suggestedTitles"', '{"', '}', '":']):
         return True
     if "<p>" in t and len(t) > 80:
         return True
     return False
+
+
+def _is_meaningful_rewrite_html(rewritten_html: str) -> bool:
+    if not rewritten_html:
+        return False
+    soup = BeautifulSoup(rewritten_html, "html.parser")
+    text = soup.get_text(" ", strip=True)
+    compact = re.sub(r"\s+", "", text)
+    if len(compact) < 60:
+        return False
+    # 排除几乎只有符号的异常内容（例如单个 "{"）
+    if re.fullmatch(r"[\{\}\[\]`'\".,:;!?，。！？：；、\-_=+()（）<>/\\\s]+", text or ""):
+        return False
+    return True
+
+
+def _build_rewrite_fallback_html(source_html: str, source_text: str) -> str:
+    """
+    当 AI 返回异常（正文过短/仅符号）时，使用原文文本兜底，避免只剩图片。
+    """
+    lines = []
+    soup = BeautifulSoup(source_html or "", "html.parser")
+    for node in soup.find_all(["h1", "h2", "h3", "p", "li"]):
+        text = node.get_text(" ", strip=True)
+        if not text:
+            continue
+        text = re.sub(r"\s+", " ", text).strip()
+        if len(text) < 2:
+            continue
+        lines.append(text)
+        if len(lines) >= 30:
+            break
+    if not lines:
+        lines = [line.strip() for line in (source_text or "").splitlines() if line.strip()][:20]
+    if not lines:
+        lines = ["原文提取成功，但改写结果异常，已启用兜底文本。"]
+    return "".join([f"<p>{html.escape(line)}</p>" for line in lines])
 
 
 def _build_image_guidance(source_html: str) -> str:
@@ -527,23 +602,49 @@ def _inject_source_images(rewritten_html: str, source_html: str):
     img_points, source_para_total = _extract_source_image_points(source)
     if not img_points:
         return str(rewritten)
+    source_img_srcs = [_normalize_image_src(src) for _, src in img_points]
+    source_img_srcs = [s for s in source_img_srcs if s]
+    if not source_img_srcs:
+        return _sanitize_image_inline_styles(str(rewritten))
 
-    # 优先让 AI 自行插入原图；只有 AI 漏图时才做兜底注入
-    if rewritten.find("img"):
+    rewritten_img_srcs = []
+    for img in rewritten.find_all("img"):
+        src = (
+            img.get("src")
+            or img.get("data-src")
+            or img.get("data-original")
+            or img.get("original-src")
+            or ""
+        )
+        normalized = _normalize_image_src(src)
+        if normalized:
+            rewritten_img_srcs.append(normalized)
+    rewritten_set = set(rewritten_img_srcs)
+
+    # 只补齐“缺失图片”，避免 AI 已保留图片被重复插入
+    missing_points = []
+    for source_para_index, src in img_points:
+        normalized_src = _normalize_image_src(src)
+        if not normalized_src:
+            continue
+        if normalized_src not in rewritten_set:
+            missing_points.append((source_para_index, normalized_src))
+            rewritten_set.add(normalized_src)
+    if not missing_points:
         return _sanitize_image_inline_styles(str(rewritten))
 
     rewritten_paras = rewritten.find_all("p")
     rewritten_para_total = len(rewritten_paras)
 
     if rewritten_para_total == 0:
-        for _, src in img_points:
+        for _, src in missing_points:
             p = rewritten.new_tag("p")
             p.append(rewritten.new_tag("img", src=src))
             rewritten.append(p)
         return _sanitize_image_inline_styles(str(rewritten))
 
     inserted_after_index = -1
-    for source_para_index, src in img_points:
+    for source_para_index, src in missing_points:
         if source_para_total <= 0:
             target_index = rewritten_para_total - 1
         else:
@@ -559,6 +660,15 @@ def _inject_source_images(rewritten_html: str, source_html: str):
         target_p.insert_after(img_p)
         inserted_after_index = target_index
     return _sanitize_image_inline_styles(str(rewritten))
+
+
+def _normalize_image_src(src: str) -> str:
+    text = html.unescape((src or "").strip())
+    if not text:
+        return ""
+    if text.startswith("//"):
+        return f"https:{text}"
+    return text
 
 
 def _sanitize_image_inline_styles(html: str) -> str:

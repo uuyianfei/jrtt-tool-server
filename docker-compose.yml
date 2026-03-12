@@ -30,7 +30,7 @@ services:
       [
         "sh",
         "-lc",
-        "Xvfb :99 -screen 0 1920x1080x24 -nolisten tcp & export DISPLAY=:99; exec python -u run_crawler.py",
+        "Xvfb :99 -screen 0 1280x720x24 -nolisten tcp & export DISPLAY=:99; exec python -u run_crawler.py",
       ]
     env_file:
       - .env
@@ -44,6 +44,11 @@ services:
       CHROMEDRIVER_PATH: ${CHROMEDRIVER_PATH:-/usr/bin/chromedriver}
       CHROME_BINARY_PATH: ${CHROME_BINARY_PATH:-/usr/bin/chromium}
       CRAWL_HEADLESS: "false"
+      AUTHOR_COLLECT_FANS_WORKERS: ${AUTHOR_COLLECT_FANS_WORKERS:-3}
+      CRAWL_LIST_INITIAL_WAIT_SECONDS: ${CRAWL_LIST_INITIAL_WAIT_SECONDS:-1.0}
+      CRAWL_LIST_REFRESH_WAIT_SECONDS: ${CRAWL_LIST_REFRESH_WAIT_SECONDS:-1.0}
+      CRAWL_LIST_SCROLL_WAIT_SECONDS: ${CRAWL_LIST_SCROLL_WAIT_SECONDS:-0.9}
+      CRAWL_LIST_NO_GROWTH_EARLY_STOP_ROUNDS: ${CRAWL_LIST_NO_GROWTH_EARLY_STOP_ROUNDS:-2}
       PYTHONUNBUFFERED: "1"
       DISPLAY: ":99"
 
@@ -57,7 +62,7 @@ services:
       [
         "sh",
         "-lc",
-        "Xvfb :99 -screen 0 1920x1080x24 -nolisten tcp & export DISPLAY=:99; exec python -u run_crawler.py",
+        "Xvfb :99 -screen 0 1280x720x24 -nolisten tcp & export DISPLAY=:99; exec python -u run_crawler.py",
       ]
     env_file:
       - .env
@@ -74,18 +79,18 @@ services:
       PYTHONUNBUFFERED: "1"
       DISPLAY: ":99"
 
-  import-authors:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: jrtt-import-authors
-    restart: "no"
-    command: ["python", "-u", "import_author_sources.py", "--file", "good_authors.json"]
-    env_file:
-      - .env
-    environment:
-      TZ: ${TZ:-Asia/Shanghai}
-      CHROMEDRIVER_PATH: ${CHROMEDRIVER_PATH:-/usr/bin/chromedriver}
-      CHROME_BINARY_PATH: ${CHROME_BINARY_PATH:-/usr/bin/chromium}
-      CRAWL_HEADLESS: "true"
-      PYTHONUNBUFFERED: "1"
+  # import-authors:
+  #   build:
+  #     context: .
+  #     dockerfile: Dockerfile
+  #   container_name: jrtt-import-authors
+  #   restart: "no"
+  #   command: ["python", "-u", "import_author_sources.py", "--file", "good_authors.json"]
+  #   env_file:
+  #     - .env
+  #   environment:
+  #     TZ: ${TZ:-Asia/Shanghai}
+  #     CHROMEDRIVER_PATH: ${CHROMEDRIVER_PATH:-/usr/bin/chromedriver}
+  #     CHROME_BINARY_PATH: ${CHROME_BINARY_PATH:-/usr/bin/chromium}
+  #     CRAWL_HEADLESS: "true"
+  #     PYTHONUNBUFFERED: "1"
