@@ -9,7 +9,7 @@ import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 from urllib.parse import urlsplit, urlunsplit
 
 from bs4 import BeautifulSoup
@@ -101,9 +101,10 @@ def sanitize_article_url_for_storage(url: str) -> str:
     return clean
 
 
-def acquire_author_leases(limit: int) -> List[AuthorSource]:
+def acquire_author_leases(limit: int, exclude_ids: Optional[Set[int]] = None) -> List[AuthorSource]:
     if limit <= 0:
         return []
+    exclude_ids = set(exclude_ids or [])
     now = cn_now_naive()
     owner = _lease_owner_name()
     lease_seconds = int(current_app.config.get("AUTHOR_LEASE_SECONDS", 240))
@@ -112,14 +113,23 @@ def acquire_author_leases(limit: int) -> List[AuthorSource]:
     lease_until = now + timedelta(seconds=lease_seconds)
 
     # 先多取一些候选，允许在竞争中部分领取失败
+    base_filters = [
+        AuthorSource.status == "active",
+        AuthorSource.followers > 0,
+        or_(AuthorSource.last_crawled_at.is_(None), AuthorSource.last_crawled_at <= earliest_next_crawl_at),
+        or_(AuthorSource.lease_until.is_(None), AuthorSource.lease_until < now),
+    ]
+    if exclude_ids:
+        base_filters.append(~AuthorSource.id.in_(exclude_ids))
     candidate_rows = (
-        AuthorSource.query.filter(
-            AuthorSource.status == "active",
-            AuthorSource.followers > 0,
-            or_(AuthorSource.last_crawled_at.is_(None), AuthorSource.last_crawled_at <= earliest_next_crawl_at),
-            or_(AuthorSource.lease_until.is_(None), AuthorSource.lease_until < now),
+        AuthorSource.query.filter(*base_filters)
+        # 最远优先：优先最久未抓取（含未抓过），其次按 id 升序稳定排序
+        .order_by(
+            AuthorSource.last_crawled_at.is_(None).desc(),
+            AuthorSource.last_crawled_at.asc(),
+            AuthorSource.last_seen_at.asc(),
+            AuthorSource.id.asc(),
         )
-        .order_by(AuthorSource.last_crawled_at.isnot(None), AuthorSource.last_crawled_at.asc(), AuthorSource.id.asc())
         .limit(limit * 3)
         .all()
     )
@@ -1371,6 +1381,7 @@ def crawl_from_author_pool(run_until_exhausted: Optional[bool] = None):
     batch_size = int(current_app.config.get("AUTHOR_CRAWL_BATCH_SIZE", 20))
     per_author_limit = int(current_app.config.get("AUTHOR_PER_AUTHOR_TARGET_COUNT", 20))
     max_fails = int(current_app.config.get("AUTHOR_MAX_FAILS", 5))
+    recrawl_h = float(current_app.config.get("AUTHOR_RECRAWL_INTERVAL_HOURS", 5))
     if run_until_exhausted is None:
         run_until_exhausted = bool(current_app.config.get("AUTHOR_ARTICLES_RUN_UNTIL_EXHAUSTED", True))
     owner = _lease_owner_name()
@@ -1378,30 +1389,29 @@ def crawl_from_author_pool(run_until_exhausted: Optional[bool] = None):
     total_changed = 0
     total_authors = 0
     lease_rounds = 0
+    processed_author_ids: Set[int] = set()
+    initial_pending_count = AuthorSource.query.filter(
+        AuthorSource.status == "active",
+        AuthorSource.followers > 0,
+        or_(AuthorSource.last_crawled_at.is_(None), AuthorSource.last_crawled_at <= (now - timedelta(hours=max(0.0, recrawl_h)))),
+        or_(AuthorSource.lease_until.is_(None), AuthorSource.lease_until < now),
+    ).count()
     try:
         while True:
-            authors = acquire_author_leases(batch_size)
+            authors = acquire_author_leases(batch_size, exclude_ids=processed_author_ids)
             if not authors:
                 if lease_rounds == 0:
                     logger.info("author articles job skipped: no leasable authors")
                 break
             lease_rounds += 1
             total_authors += len(authors)
-            # 当前批次剩余可抓作者数（不含已领取的）
-            now_check = cn_now_naive()
-            recrawl_h = float(current_app.config.get("AUTHOR_RECRAWL_INTERVAL_HOURS", 5))
-            earliest_check = now_check - timedelta(hours=max(0.0, recrawl_h))
-            remaining_count = AuthorSource.query.filter(
-                AuthorSource.status == "active",
-                AuthorSource.followers > 0,
-                or_(AuthorSource.last_crawled_at.is_(None), AuthorSource.last_crawled_at <= earliest_check),
-                or_(AuthorSource.lease_until.is_(None), AuthorSource.lease_until < now_check),
-            ).count()
+            remaining_snapshot = max(0, initial_pending_count - total_authors)
             logger.info(
-                "【进度】本轮批次=%s 已处理作者=%s 队列剩余待抓=%s 累计入库文章=%s",
+                "【进度】本轮批次=%s 本次已处理作者=%s 本次剩余待抓=%s(初始=%s) 本次累计入库文章=%s",
                 len(authors),
                 total_authors,
-                remaining_count,
+                remaining_snapshot,
+                initial_pending_count,
                 total_changed,
             )
 
@@ -1410,6 +1420,7 @@ def crawl_from_author_pool(run_until_exhausted: Optional[bool] = None):
 
             for idx, author in enumerate(authors, start=1):
                 author_id = int(author.id)
+                processed_author_ids.add(author_id)
                 author_url = author.author_url
                 author_name = author.author_name
                 author_followers = int(author.followers or 0)
