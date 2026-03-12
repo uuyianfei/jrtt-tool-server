@@ -96,6 +96,7 @@ services:
     environment:
       TZ: ${TZ:-Asia/Shanghai}
       CRAWL_JOB_ENABLED: "true"
+      CRAWL_DIRECT_RECOMMEND_ENABLED: "true"
       AUTHOR_COLLECT_JOB_ENABLED: "false"
       AUTHOR_ARTICLES_JOB_ENABLED: "false"
       CLEANUP_JOB_ENABLED: "false"
@@ -107,6 +108,30 @@ services:
       CRAWL_INTERVAL_SECONDS: ${CRAWL_INTERVAL_SECONDS:-120}
       PYTHONUNBUFFERED: "1"
       DISPLAY: ":99"
+
+  fast-crawler:
+    build:
+      context: .
+      dockerfile: Dockerfile.fast
+    container_name: jrtt-fast-crawler
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      FAST_CRAWL_ENABLED: "true"
+      FAST_CRAWL_INTERVAL_SECONDS: ${FAST_CRAWL_INTERVAL_SECONDS:-300}
+      FAST_CRAWL_CHANNELS: ${FAST_CRAWL_CHANNELS:-__all__,news_hot,news_tech,news_finance,news_entertainment,news_sports}
+      FAST_CRAWL_CONCURRENCY: ${FAST_CRAWL_CONCURRENCY:-10}
+      FAST_CRAWL_MAX_HOURS: ${FAST_CRAWL_MAX_HOURS:-24}
+      FAST_CRAWL_MAX_PAGES_PER_CHANNEL: ${FAST_CRAWL_MAX_PAGES_PER_CHANNEL:-50}
+      FAST_CRAWL_REQUEST_DELAY: ${FAST_CRAWL_REQUEST_DELAY:-0.3}
+      # Disable all Selenium-based jobs
+      CRAWL_JOB_ENABLED: "false"
+      AUTHOR_COLLECT_JOB_ENABLED: "false"
+      AUTHOR_ARTICLES_JOB_ENABLED: "false"
+      CLEANUP_JOB_ENABLED: "false"
+      PYTHONUNBUFFERED: "1"
 
   # import-authors:
   #   build:

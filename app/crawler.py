@@ -1689,6 +1689,29 @@ def run_crawl_job():
     logger.info("crawl job finished, upserted=%s", changed)
 
 
+def run_recommend_news_job():
+    logger.info("recommend news job started (direct from recommend page)")
+    target_count = int(current_app.config.get("CRAWL_TARGET_COUNT", 20))
+    max_hours = float(current_app.config.get("CRAWL_MAX_HOURS", 24))
+    min_views = int(current_app.config.get("AUTHOR_ARTICLE_MIN_VIEWS", 0))
+    crawl_headless = bool(current_app.config.get("CRAWL_HEADLESS", True))
+    crawler = ToutiaoCrawler(headless=crawl_headless)
+    try:
+        items = crawler.crawl_recommend_page(target_count=target_count)
+        if not items:
+            logger.info("recommend news job finished, no items from recommend page")
+            return 0
+        changed = upsert_articles(items, max_hours=max_hours, min_views=min_views, shared_crawler=crawler)
+        logger.info(
+            "recommend news job finished selected=%s upserted=%s",
+            len(items),
+            changed,
+        )
+        return int(changed or 0)
+    finally:
+        crawler.close()
+
+
 def run_author_collect_job():
     stats = collect_authors_from_recommend(return_stats=True)
     continuous_enabled = bool(current_app.config.get("AUTHOR_ARTICLES_CONTINUOUS_ENABLED", True))

@@ -24,6 +24,7 @@ class Config:
     SQLALCHEMY_TRACK_MODIFICATIONS = False
 
     CRAWL_INTERVAL_SECONDS = int(os.getenv("CRAWL_INTERVAL_SECONDS", "120"))
+    CRAWL_DIRECT_RECOMMEND_ENABLED = os.getenv("CRAWL_DIRECT_RECOMMEND_ENABLED", "false").lower() == "true"
     CLEANUP_INTERVAL_MINUTES = int(os.getenv("CLEANUP_INTERVAL_MINUTES", "30"))
     CRAWL_JOB_ENABLED = os.getenv("CRAWL_JOB_ENABLED", "true").lower() == "true"
     CLEANUP_JOB_ENABLED = os.getenv("CLEANUP_JOB_ENABLED", "true").lower() == "true"
@@ -73,3 +74,17 @@ class Config:
     DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
     DEEPSEEK_API_URL = os.getenv("DEEPSEEK_API_URL", "https://api.deepseek.com/v1/chat/completions")
     DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+
+    # --- Fast HTTP Crawler ---
+    FAST_CRAWL_ENABLED = os.getenv("FAST_CRAWL_ENABLED", "false").lower() == "true"
+    FAST_CRAWL_INTERVAL_SECONDS = int(os.getenv("FAST_CRAWL_INTERVAL_SECONDS", "300"))
+    FAST_CRAWL_CHANNELS = os.getenv(
+        "FAST_CRAWL_CHANNELS",
+        "__all__,news_hot,news_tech,news_finance,news_entertainment,news_sports",
+    )
+    FAST_CRAWL_CONCURRENCY = int(os.getenv("FAST_CRAWL_CONCURRENCY", "10"))
+    FAST_CRAWL_MAX_HOURS = float(os.getenv("FAST_CRAWL_MAX_HOURS", "24"))
+    FAST_CRAWL_MAX_PAGES_PER_CHANNEL = int(os.getenv("FAST_CRAWL_MAX_PAGES_PER_CHANNEL", "50"))
+    FAST_CRAWL_REQUEST_DELAY = float(os.getenv("FAST_CRAWL_REQUEST_DELAY", "0.3"))
+    FAST_CRAWL_MIN_CONTENT_LENGTH = int(os.getenv("FAST_CRAWL_MIN_CONTENT_LENGTH", "80"))
+    FAST_CRAWL_MAX_FANS = int(os.getenv("FAST_CRAWL_MAX_FANS", "0"))  # 0 = no limit

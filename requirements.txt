@@ -9,3 +9,4 @@ selenium==4.27.1
 webdriver-manager==4.0.2
 openpyxl==3.1.5
 python-docx==1.1.2
+httpx==0.28.1
