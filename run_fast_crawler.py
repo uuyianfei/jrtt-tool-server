@@ -7,7 +7,7 @@ import sys
 from app import create_app
 from app.fast_crawler import FastCrawler
 
-app = create_app(enable_scheduler=False)
+app = create_app(enable_scheduler=True)
 
 
 async def main():

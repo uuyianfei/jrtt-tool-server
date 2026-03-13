@@ -14,6 +14,8 @@ from flask import current_app
 from sqlalchemy import or_
 
 from .crawler import ToutiaoCrawler, normalize_article_url
+
+import httpx
 from .extensions import db
 from .models import Article, RewriteTask
 from .time_utils import cn_now_naive
@@ -122,12 +124,15 @@ def _fetch_source(url: str):
         _ensure_valid_source_content(normalized_url or raw_url, html, text)
         return html, title, text
 
-    # 未命中数据库时，改为使用 Selenium 爬虫抓取原文（与爬虫 job 同源）
-    # 先做 URL 兜底校验，避免无效链接触发浏览器抓取卡顿
     if not _is_supported_toutiao_url(normalized_url):
         raise ValueError("仅支持头条文章链接，请检查链接是否完整可访问")
 
-    # rewrite 走 API 服务，不依赖 Xvfb，固定使用 headless 以避免显示环境导致阻塞
+    # 优先通过移动端 Info API 获取（快速，无需 Selenium）
+    result = _fetch_via_info_api(normalized_url)
+    if result:
+        return result
+
+    # Info API 失败时回退到 Selenium
     crawler = ToutiaoCrawler(headless=True)
     try:
         details = crawler._get_article_details(normalized_url)
@@ -147,6 +152,47 @@ def _fetch_source(url: str):
     text = _html_to_text(html)
     _ensure_valid_source_content(final_url or normalized_url, html, text)
     return html, title, text
+
+
+def _extract_group_id(url: str) -> str:
+    """Extract numeric group/article ID from various Toutiao URL formats."""
+    m = re.search(r"/(?:article|group|a|i)/?(\d{10,})/?", url)
+    return m.group(1) if m else ""
+
+
+def _fetch_via_info_api(url: str):
+    """Fetch article via mobile Info API. Returns (html, title, text) or None."""
+    gid = _extract_group_id(url)
+    if not gid:
+        return None
+    try:
+        resp = httpx.get(
+            f"https://m.toutiao.com/i{gid}/info/",
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+                ),
+            },
+            timeout=15,
+            follow_redirects=True,
+        )
+        if resp.status_code != 200:
+            return None
+        data = resp.json().get("data") or {}
+        if not data.get("content"):
+            return None
+        content_html = data["content"].strip()
+        if not content_html.strip().startswith("<article"):
+            content_html = f"<article>{content_html}</article>"
+        content_html = _sanitize_image_inline_styles(content_html)
+        title = (data.get("title") or "").strip() or "原标题"
+        text = _html_to_text(content_html)
+        _ensure_valid_source_content(url, content_html, text)
+        return content_html, title, text
+    except Exception as exc:
+        logger.info("info api fetch failed gid=%s err=%s, falling back", gid, exc)
+        return None
 
 
 def _run_with_timeout(func, timeout_seconds: int, stage: str, **kwargs):
