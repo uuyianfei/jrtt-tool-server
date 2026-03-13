@@ -9,6 +9,7 @@ Data flow:
 import asyncio
 import logging
 import random
+import re
 import time
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Set
@@ -67,6 +68,23 @@ def _commit_with_retry(max_retries: int = 3, sleep_seconds: float = 0.3):
 
 def _normalize_article_url(group_id: str) -> str:
     return f"https://www.toutiao.com/article/{group_id}/"
+
+
+def _extract_first_image(content_html: str) -> str:
+    """Extract the first accessible image URL from article content HTML."""
+    if not content_html:
+        return ""
+    match = re.search(
+        r'<img[^>]+(?:src|data-src|original-src)\s*=\s*["\']([^"\']+)["\']',
+        content_html,
+        re.IGNORECASE,
+    )
+    if not match:
+        return ""
+    url = match.group(1).strip()
+    if url.startswith("//"):
+        url = f"https:{url}"
+    return url
 
 
 class FastCrawler:
@@ -249,6 +267,7 @@ class FastCrawler:
             "skip_time": 0,
             "skip_content": 0,
             "skip_title": 0,
+            "skip_no_engagement": 0,
             "created": 0,
             "updated": 0,
             "errors": 0,
@@ -307,6 +326,13 @@ class FastCrawler:
                     stats["skip_time"] += 1
                     continue
 
+                # Engagement filter: skip articles with 0 reads or 0 likes
+                view_count = int(info.get("impression_count") or 0)
+                like_count = int(info.get("digg_count") or 0)
+                if view_count <= 0 or like_count <= 0:
+                    stats["skip_no_engagement"] += 1
+                    continue
+
                 # Content filter
                 content_html = (info.get("content") or "").strip()
                 content_text = ""
@@ -335,13 +361,7 @@ class FastCrawler:
                 article.title = title[:255]
                 article.url = article_url
                 article.url_hash = url_hash
-                article.cover = (
-                    feed_item.get("image_url")
-                    or info.get("poster_url")
-                    or ""
-                )
-                if article.cover and article.cover.startswith("//"):
-                    article.cover = f"https:{article.cover}"
+                article.cover = _extract_first_image(content_html)
                 article.author = author
                 author_uid = media_user.get("id") or info.get("creator_uid") or ""
                 article.author_url = (
@@ -353,9 +373,13 @@ class FastCrawler:
                 article.published_hours_ago = max(
                     0.0, (now - (published_at or now)).total_seconds() / 3600
                 )
+                # Wrap content in <article> tag for consistency with Selenium crawler
+                if content_html and not content_html.strip().startswith("<article"):
+                    content_html = f"<article>{content_html}</article>"
+
                 article.followers = followers
-                article.view_count = int(info.get("impression_count") or 0)
-                article.like_count = int(info.get("digg_count") or 0)
+                article.view_count = view_count
+                article.like_count = like_count
                 article.comment_count = int(
                     info.get("comment_count") or feed_item.get("comments_count") or 0
                 )
@@ -380,11 +404,11 @@ class FastCrawler:
         logger.info(
             "upsert summary candidates=%s info_ok=%s created=%s updated=%s "
             "skip_no_info=%s skip_micro=%s skip_video=%s skip_author=%s "
-            "skip_fans=%s skip_time=%s skip_content=%s skip_title=%s errors=%s",
+            "skip_fans=%s skip_time=%s skip_engagement=%s skip_content=%s skip_title=%s errors=%s",
             stats["candidates"], stats["info_fetched"], stats["created"], stats["updated"],
             stats["skip_no_info"], stats["skip_micro"], stats["skip_video"], stats["skip_author"],
-            stats["skip_fans"], stats["skip_time"], stats["skip_content"], stats["skip_title"],
-            stats["errors"],
+            stats["skip_fans"], stats["skip_time"], stats["skip_no_engagement"],
+            stats["skip_content"], stats["skip_title"], stats["errors"],
         )
         return affected
 
