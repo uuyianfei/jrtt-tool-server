@@ -145,8 +145,7 @@ def export_articles():
             "阅读数",
             "点赞数",
             "评论数",
-            "发布时间文本",
-            "发布时间(小时前)",
+            "发布时间",
         ]
     )
 
@@ -154,6 +153,7 @@ def export_articles():
         hours_ago = row.published_hours_ago
         if row.published_at:
             hours_ago = max(0, (now - row.published_at).total_seconds() / 3600)
+        published_at = row.published_at or (now - timedelta(hours=float(hours_ago or 0)))
         ws.append(
             [
                 row.article_id or f"a-{row.id}",
@@ -164,8 +164,7 @@ def export_articles():
                 int(row.view_count or 0),
                 int(row.like_count or 0),
                 int(row.comment_count or 0),
-                row.publish_time_text or "",
-                round(float(hours_ago or 0), 2),
+                published_at.strftime("%Y-%m-%d %H:%M:%S"),
             ]
         )
 
