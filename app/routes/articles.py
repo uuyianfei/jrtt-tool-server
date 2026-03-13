@@ -1,3 +1,4 @@
+from datetime import timedelta
 from io import BytesIO
 
 from flask import Blueprint, request
@@ -37,12 +38,13 @@ def _build_filtered_query(body):
     if sort_order not in {"asc", "desc"}:
         return None, error_response(4001, "sortOrder 仅支持 asc|desc")
 
-    q = Article.query.filter(Article.published_hours_ago <= 24)
+    now = cn_now_naive()
+    q = Article.query.filter(Article.published_at >= now - timedelta(hours=24))
     if max_hours is not None:
         try:
             max_hours = float(max_hours)
-            q = q.filter(Article.published_hours_ago <= max_hours)
-        except ValueError:
+            q = q.filter(Article.published_at >= now - timedelta(hours=max_hours))
+        except (ValueError, TypeError):
             return None, error_response(4001, "maxPublishedHours 参数无效")
 
     q = _apply_numeric_filter(q, Article.followers, body.get("followerFilter"))
