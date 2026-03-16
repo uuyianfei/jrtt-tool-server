@@ -58,39 +58,21 @@ python run.py
 ### 启动
 
 ```bash
-docker compose --profile fast-baseline up -d --build
+docker compose up -d --build
 ```
 
-说明：`docker-compose.yml` 已支持 Fast Crawler 三种运行模式：
-- `fast-baseline`：单实例全频道（基线）
-- `fast-canary`：3 实例分片（`hot/tech/finance`）
-- `fast-full`：5 实例分片（`hot/tech/finance/entertainment/sports`）
+说明：`docker-compose.yml` 启动两个服务：
+- `api`：仅提供接口，不跑定时任务
+- `fast-crawler`：单实例全频道爬虫（默认 13 个频道、每 2 分钟一轮）
 
-多实例模式下每个实例抓取互斥频道，避免同配置多实例重复抓取。
 `docker compose` 会自动读取项目根目录 `.env`，请先配置
 `MYSQL_HOST/MYSQL_PORT/MYSQL_USER/MYSQL_PASSWORD/MYSQL_DB`。
-
-### 分阶段启动示例
-
-```bash
-# 1) 基线：单实例
-docker compose --profile fast-baseline up -d --build
-
-# 2) 灰度：3 分片（先停基线）
-docker compose --profile fast-baseline down
-docker compose --profile fast-canary up -d --build
-
-# 3) 全量：5 分片
-docker compose --profile fast-canary down
-docker compose --profile fast-full up -d --build
-```
 
 ### 查看日志
 
 ```bash
 docker compose logs -f api
 docker compose logs -f fast-crawler
-docker compose logs -f fast-crawler-hot fast-crawler-tech fast-crawler-finance
 ```
 
 ### 停止并清理
@@ -152,17 +134,8 @@ SSH 端口固定使用默认 `22`，无需配置 `SSH_PORT`。
 ### 日志侧快速统计
 
 ```bash
-# 基线模式
 docker compose logs --since=10m fast-crawler \
-  | python tools/fast_crawler_metrics.py --window-minutes 10
-
-# 灰度/全量分片模式（按服务分别统计）
-docker compose logs --since=10m fast-crawler-hot \
-  | python tools/fast_crawler_metrics.py --window-minutes 10
-docker compose logs --since=10m fast-crawler-tech \
-  | python tools/fast_crawler_metrics.py --window-minutes 10
-docker compose logs --since=10m fast-crawler-finance \
-  | python tools/fast_crawler_metrics.py --window-minutes 10
+  | python3 tools/fast_crawler_metrics.py --window-minutes 10
 ```
 
 ### 数据库侧快速统计（可选）
@@ -184,14 +157,10 @@ FROM articles
 WHERE last_seen_at >= NOW() - INTERVAL 10 MINUTE;
 ```
 
-### 逐步调参建议（一次只改一个变量）
+### 调参建议
 
-1. 先调 `FAST_CRAWL_MAX_PAGES_PER_CHANNEL_*`（每次 +10）
-2. 再调 `FAST_CRAWL_CONCURRENCY_*`（每次 +2）
-3. 每次调整后观察至少 1 个 10 分钟窗口
-4. 若 `avg_elapsed_seconds` 接近 interval、`rate_limited` 上升、`created_ratio` 下降，则回退
-
-### 加固项（已内置）
-
-- 多实例下新增 `conflict_retry` 统计：同一文章并发写入冲突会自动重试更新，减少整批回滚风险。
-- 新增 `FAST_CRAWL_STARTUP_JITTER_SECONDS` 与 `FAST_CRAWL_LOOP_JITTER_SECONDS`，用于多实例错峰，降低突发请求峰值。
+1. `FAST_CRAWL_INTERVAL_SECONDS`：缩短可增加轮次（推荐 60~120），注意 429 限流
+2. `FAST_CRAWL_CHANNELS`：增加频道 = 更多候选（每频道每轮约 10~15 条）
+3. `FAST_CRAWL_CONCURRENCY`：详情 API 并发数（每次 +2 观察）
+4. 每次只改一个变量，观察 10 分钟窗口
+5. 若 `avg_elapsed_seconds` 接近 interval、`rate_limited` 上升，则回退

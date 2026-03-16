@@ -77,10 +77,11 @@ class Config:
 
     # --- Fast HTTP Crawler ---
     FAST_CRAWL_ENABLED = os.getenv("FAST_CRAWL_ENABLED", "false").lower() == "true"
-    FAST_CRAWL_INTERVAL_SECONDS = int(os.getenv("FAST_CRAWL_INTERVAL_SECONDS", "300"))
+    FAST_CRAWL_INTERVAL_SECONDS = int(os.getenv("FAST_CRAWL_INTERVAL_SECONDS", "120"))
     FAST_CRAWL_CHANNELS = os.getenv(
         "FAST_CRAWL_CHANNELS",
-        "__all__,news_hot,news_tech,news_finance,news_entertainment,news_sports",
+        "__all__,news_hot,news_tech,news_finance,news_entertainment,news_sports,"
+        "news_society,news_car,news_health,news_military,news_world,news_travel,news_history",
     )
     FAST_CRAWL_CONCURRENCY = int(os.getenv("FAST_CRAWL_CONCURRENCY", "10"))
     FAST_CRAWL_MAX_HOURS = float(os.getenv("FAST_CRAWL_MAX_HOURS", "24"))

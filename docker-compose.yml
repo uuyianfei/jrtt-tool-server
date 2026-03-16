@@ -1,25 +1,3 @@
-x-fast-crawler-env: &fast_crawler_env
-  TZ: ${TZ:-Asia/Shanghai}
-  FAST_CRAWL_ENABLED: "true"
-  FAST_CRAWL_INTERVAL_SECONDS: ${FAST_CRAWL_INTERVAL_SECONDS:-300}
-  FAST_CRAWL_CONCURRENCY: ${FAST_CRAWL_CONCURRENCY:-10}
-  FAST_CRAWL_MAX_HOURS: ${FAST_CRAWL_MAX_HOURS:-24}
-  FAST_CRAWL_MAX_PAGES_PER_CHANNEL: ${FAST_CRAWL_MAX_PAGES_PER_CHANNEL:-50}
-  FAST_CRAWL_REQUEST_DELAY: ${FAST_CRAWL_REQUEST_DELAY:-0.3}
-  CRAWL_JOB_ENABLED: "false"
-  AUTHOR_COLLECT_JOB_ENABLED: "false"
-  AUTHOR_ARTICLES_JOB_ENABLED: "false"
-  CLEANUP_JOB_ENABLED: "false"
-  PYTHONUNBUFFERED: "1"
-
-x-fast-crawler-common: &fast_crawler_common
-  build:
-    context: .
-    dockerfile: Dockerfile.fast
-  restart: unless-stopped
-  env_file:
-    - .env
-
 services:
   api:
     build:
@@ -36,170 +14,30 @@ services:
       AUTHOR_ARTICLES_JOB_ENABLED: "false"
       CLEANUP_JOB_ENABLED: "false"
       CRAWL_HEADLESS: "true"
-      # 容器内 Selenium 路径默认值；如 .env 已设置则以 .env 为准
       CHROMEDRIVER_PATH: ${CHROMEDRIVER_PATH:-/usr/bin/chromedriver}
       CHROME_BINARY_PATH: ${CHROME_BINARY_PATH:-/usr/bin/chromium}
     ports:
       - "5000:5000"
 
-  # --- 以下旧 Selenium 爬虫已暂停，由 fast-crawler 替代 ---
-  # author-collect:
-  #   build:
-  #     context: .
-  #     dockerfile: Dockerfile
-  #   container_name: jrtt-author-collect
-  #   restart: unless-stopped
-  #   command:
-  #     [
-  #       "sh",
-  #       "-lc",
-  #       "Xvfb :99 -screen 0 1280x720x24 -nolisten tcp & export DISPLAY=:99; exec python -u run_crawler.py",
-  #     ]
-  #   env_file:
-  #     - .env
-  #   environment:
-  #     TZ: ${TZ:-Asia/Shanghai}
-  #     CRAWL_JOB_ENABLED: "false"
-  #     AUTHOR_COLLECT_JOB_ENABLED: "true"
-  #     AUTHOR_ARTICLES_JOB_ENABLED: "false"
-  #     CLEANUP_JOB_ENABLED: "false"
-  #     WORKER_ROLE: "author-collect"
-  #     CHROMEDRIVER_PATH: ${CHROMEDRIVER_PATH:-/usr/bin/chromedriver}
-  #     CHROME_BINARY_PATH: ${CHROME_BINARY_PATH:-/usr/bin/chromium}
-  #     CRAWL_HEADLESS: "false"
-  #     AUTHOR_COLLECT_FANS_WORKERS: ${AUTHOR_COLLECT_FANS_WORKERS:-3}
-  #     CRAWL_LIST_INITIAL_WAIT_SECONDS: ${CRAWL_LIST_INITIAL_WAIT_SECONDS:-1.0}
-  #     CRAWL_LIST_REFRESH_WAIT_SECONDS: ${CRAWL_LIST_REFRESH_WAIT_SECONDS:-1.0}
-  #     CRAWL_LIST_SCROLL_WAIT_SECONDS: ${CRAWL_LIST_SCROLL_WAIT_SECONDS:-0.9}
-  #     CRAWL_LIST_NO_GROWTH_EARLY_STOP_ROUNDS: ${CRAWL_LIST_NO_GROWTH_EARLY_STOP_ROUNDS:-2}
-  #     PYTHONUNBUFFERED: "1"
-  #     DISPLAY: ":99"
-
-  # author-articles:
-  #   build:
-  #     context: .
-  #     dockerfile: Dockerfile
-  #   container_name: jrtt-author-articles
-  #   restart: unless-stopped
-  #   command:
-  #     [
-  #       "sh",
-  #       "-lc",
-  #       "Xvfb :99 -screen 0 1280x720x24 -nolisten tcp & export DISPLAY=:99; exec python -u run_crawler.py",
-  #     ]
-  #   env_file:
-  #     - .env
-  #   environment:
-  #     TZ: ${TZ:-Asia/Shanghai}
-  #     CRAWL_JOB_ENABLED: "false"
-  #     AUTHOR_COLLECT_JOB_ENABLED: "false"
-  #     AUTHOR_ARTICLES_JOB_ENABLED: "true"
-  #     CLEANUP_JOB_ENABLED: "true"
-  #     WORKER_ROLE: "author-articles"
-  #     CHROMEDRIVER_PATH: ${CHROMEDRIVER_PATH:-/usr/bin/chromedriver}
-  #     CHROME_BINARY_PATH: ${CHROME_BINARY_PATH:-/usr/bin/chromium}
-  #     CRAWL_HEADLESS: "false"
-  #     PYTHONUNBUFFERED: "1"
-  #     DISPLAY: ":99"
-
-  # recommend-news:
-  #   build:
-  #     context: .
-  #     dockerfile: Dockerfile
-  #   container_name: jrtt-recommend-news
-  #   restart: unless-stopped
-  #   command:
-  #     [
-  #       "sh",
-  #       "-lc",
-  #       "Xvfb :99 -screen 0 1280x720x24 -nolisten tcp & export DISPLAY=:99; exec python -u run_crawler.py",
-  #     ]
-  #   env_file:
-  #     - .env
-  #   environment:
-  #     TZ: ${TZ:-Asia/Shanghai}
-  #     CRAWL_JOB_ENABLED: "true"
-  #     CRAWL_DIRECT_RECOMMEND_ENABLED: "true"
-  #     AUTHOR_COLLECT_JOB_ENABLED: "false"
-  #     AUTHOR_ARTICLES_JOB_ENABLED: "false"
-  #     CLEANUP_JOB_ENABLED: "false"
-  #     WORKER_ROLE: "recommend-news"
-  #     CHROMEDRIVER_PATH: ${CHROMEDRIVER_PATH:-/usr/bin/chromedriver}
-  #     CHROME_BINARY_PATH: ${CHROME_BINARY_PATH:-/usr/bin/chromium}
-  #     CRAWL_HEADLESS: "false"
-  #     CRAWL_INTERVAL_SECONDS: ${CRAWL_INTERVAL_SECONDS:-120}
-  #     PYTHONUNBUFFERED: "1"
-  #     DISPLAY: ":99"
-
-  # 单实例基线模式（默认）
   fast-crawler:
-    <<: *fast_crawler_common
-    profiles: ["fast-baseline"]
+    build:
+      context: .
+      dockerfile: Dockerfile.fast
+    container_name: jrtt-fast-crawler
+    restart: unless-stopped
+    env_file:
+      - .env
     environment:
-      <<: *fast_crawler_env
-      FAST_CRAWL_CHANNELS: ${FAST_CRAWL_CHANNELS:-__all__,news_hot,news_tech,news_finance,news_entertainment,news_sports}
+      TZ: ${TZ:-Asia/Shanghai}
+      FAST_CRAWL_ENABLED: "true"
+      FAST_CRAWL_INTERVAL_SECONDS: ${FAST_CRAWL_INTERVAL_SECONDS:-120}
+      FAST_CRAWL_CHANNELS: ${FAST_CRAWL_CHANNELS:-__all__,news_hot,news_tech,news_finance,news_entertainment,news_sports,news_society,news_car,news_health,news_military,news_world,news_travel,news_history}
+      FAST_CRAWL_CONCURRENCY: ${FAST_CRAWL_CONCURRENCY:-10}
+      FAST_CRAWL_MAX_HOURS: ${FAST_CRAWL_MAX_HOURS:-24}
+      FAST_CRAWL_MAX_PAGES_PER_CHANNEL: ${FAST_CRAWL_MAX_PAGES_PER_CHANNEL:-50}
+      FAST_CRAWL_REQUEST_DELAY: ${FAST_CRAWL_REQUEST_DELAY:-0.3}
+      CRAWL_JOB_ENABLED: "false"
+      AUTHOR_COLLECT_JOB_ENABLED: "false"
+      AUTHOR_ARTICLES_JOB_ENABLED: "false"
       CLEANUP_JOB_ENABLED: "true"
-
-  # 灰度分片：先启动 3 个频道观察收益
-  fast-crawler-hot:
-    <<: *fast_crawler_common
-    profiles: ["fast-canary", "fast-full"]
-    environment:
-      <<: *fast_crawler_env
-      FAST_CRAWL_CHANNELS: news_hot
-      CLEANUP_JOB_ENABLED: "true"
-      FAST_CRAWL_CONCURRENCY: ${FAST_CRAWL_CONCURRENCY_HOT:-10}
-      FAST_CRAWL_MAX_PAGES_PER_CHANNEL: ${FAST_CRAWL_MAX_PAGES_PER_CHANNEL_HOT:-50}
-
-  fast-crawler-tech:
-    <<: *fast_crawler_common
-    profiles: ["fast-canary", "fast-full"]
-    environment:
-      <<: *fast_crawler_env
-      FAST_CRAWL_CHANNELS: news_tech
-      FAST_CRAWL_CONCURRENCY: ${FAST_CRAWL_CONCURRENCY_TECH:-10}
-      FAST_CRAWL_MAX_PAGES_PER_CHANNEL: ${FAST_CRAWL_MAX_PAGES_PER_CHANNEL_TECH:-50}
-
-  fast-crawler-finance:
-    <<: *fast_crawler_common
-    profiles: ["fast-canary", "fast-full"]
-    environment:
-      <<: *fast_crawler_env
-      FAST_CRAWL_CHANNELS: news_finance
-      FAST_CRAWL_CONCURRENCY: ${FAST_CRAWL_CONCURRENCY_FINANCE:-10}
-      FAST_CRAWL_MAX_PAGES_PER_CHANNEL: ${FAST_CRAWL_MAX_PAGES_PER_CHANNEL_FINANCE:-50}
-
-  # 全量分片：在灰度稳定后再开启剩余频道
-  fast-crawler-entertainment:
-    <<: *fast_crawler_common
-    profiles: ["fast-full"]
-    environment:
-      <<: *fast_crawler_env
-      FAST_CRAWL_CHANNELS: news_entertainment
-      FAST_CRAWL_CONCURRENCY: ${FAST_CRAWL_CONCURRENCY_ENTERTAINMENT:-10}
-      FAST_CRAWL_MAX_PAGES_PER_CHANNEL: ${FAST_CRAWL_MAX_PAGES_PER_CHANNEL_ENTERTAINMENT:-50}
-
-  fast-crawler-sports:
-    <<: *fast_crawler_common
-    profiles: ["fast-full"]
-    environment:
-      <<: *fast_crawler_env
-      FAST_CRAWL_CHANNELS: news_sports
-      FAST_CRAWL_CONCURRENCY: ${FAST_CRAWL_CONCURRENCY_SPORTS:-10}
-      FAST_CRAWL_MAX_PAGES_PER_CHANNEL: ${FAST_CRAWL_MAX_PAGES_PER_CHANNEL_SPORTS:-50}
-
-  # import-authors:
-  #   build:
-  #     context: .
-  #     dockerfile: Dockerfile
-  #   container_name: jrtt-import-authors
-  #   restart: "no"
-  #   command: ["python", "-u", "import_author_sources.py", "--file", "good_authors.json"]
-  #   env_file:
-  #     - .env
-  #   environment:
-  #     TZ: ${TZ:-Asia/Shanghai}
-  #     CHROMEDRIVER_PATH: ${CHROMEDRIVER_PATH:-/usr/bin/chromedriver}
-  #     CHROME_BINARY_PATH: ${CHROME_BINARY_PATH:-/usr/bin/chromium}
-  #     CRAWL_HEADLESS: "true"
-  #     PYTHONUNBUFFERED: "1"
+      PYTHONUNBUFFERED: "1"
