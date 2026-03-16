@@ -58,25 +58,39 @@ python run.py
 ### 启动
 
 ```bash
-docker compose up -d --build
+docker compose --profile fast-baseline up -d --build
 ```
 
-说明：当前 `docker-compose.yml` 启动三个服务：
-- `api`：仅提供接口，不跑定时爬虫任务
-- `author-collect`：仅负责推荐页作者采集与作者池更新
-- `author-articles`：仅负责作者文章抓取、文章入库与过期清理
+说明：`docker-compose.yml` 已支持 Fast Crawler 三种运行模式：
+- `fast-baseline`：单实例全频道（基线）
+- `fast-canary`：3 实例分片（`hot/tech/finance`）
+- `fast-full`：5 实例分片（`hot/tech/finance/entertainment/sports`）
 
-两条爬虫链路完全解耦，并通过作者租约锁避免重复抓同一作者。
-MySQL 使用外部云数据库。
-`docker compose` 会自动读取项目根目录 `.env`，请先把
-`MYSQL_HOST/MYSQL_PORT/MYSQL_USER/MYSQL_PASSWORD/MYSQL_DB` 配成你的云数据库信息。
+多实例模式下每个实例抓取互斥频道，避免同配置多实例重复抓取。
+`docker compose` 会自动读取项目根目录 `.env`，请先配置
+`MYSQL_HOST/MYSQL_PORT/MYSQL_USER/MYSQL_PASSWORD/MYSQL_DB`。
+
+### 分阶段启动示例
+
+```bash
+# 1) 基线：单实例
+docker compose --profile fast-baseline up -d --build
+
+# 2) 灰度：3 分片（先停基线）
+docker compose --profile fast-baseline down
+docker compose --profile fast-canary up -d --build
+
+# 3) 全量：5 分片
+docker compose --profile fast-canary down
+docker compose --profile fast-full up -d --build
+```
 
 ### 查看日志
 
 ```bash
 docker compose logs -f api
-docker compose logs -f author-collect
-docker compose logs -f author-articles
+docker compose logs -f fast-crawler
+docker compose logs -f fast-crawler-hot fast-crawler-tech fast-crawler-finance
 ```
 
 ### 停止并清理
@@ -128,23 +142,30 @@ SSH 端口固定使用默认 `22`，无需配置 `SSH_PORT`。
 
 ## 7. 吞吐与稳定性验收基线
 
-建议每次优化后固定观察 10 分钟窗口，按以下指标对比：
+建议每次扩容或调参后固定观察 10 分钟窗口，按以下指标对比：
 
-- `每10分钟新增文章数`
-- `每10分钟处理作者数`
-- `锁冲突异常数（1205/1213）`
-- `PendingRollbackError 数`
+- `created_per_min`（新增入库速率）
+- `upserted_per_min`（总写入速率）
+- `avg_elapsed_seconds` 与 `FAST_CRAWL_INTERVAL_SECONDS` 的比值
+- `rate_limited`（429）与 `errors`
 
 ### 日志侧快速统计
 
 ```bash
-docker compose logs --since=10m author-articles | grep -c "upsert success article_id="
-docker compose logs --since=10m author-articles | grep -c "author articles summary"
-docker compose logs --since=10m author-collect | grep -c "author collect summary"
-docker compose logs --since=10m author-articles | grep -E "1205|1213|PendingRollbackError"
+# 基线模式
+docker compose logs --since=10m fast-crawler \
+  | python tools/fast_crawler_metrics.py --window-minutes 10
+
+# 灰度/全量分片模式（按服务分别统计）
+docker compose logs --since=10m fast-crawler-hot \
+  | python tools/fast_crawler_metrics.py --window-minutes 10
+docker compose logs --since=10m fast-crawler-tech \
+  | python tools/fast_crawler_metrics.py --window-minutes 10
+docker compose logs --since=10m fast-crawler-finance \
+  | python tools/fast_crawler_metrics.py --window-minutes 10
 ```
 
-### 数据库侧快速统计
+### 数据库侧快速统计（可选）
 
 ```sql
 -- 最近 10 分钟新增文章
@@ -157,8 +178,20 @@ SELECT COUNT(*) AS processed_authors_10m
 FROM author_sources
 WHERE last_crawled_at >= NOW() - INTERVAL 10 MINUTE;
 
--- 当前租约中作者（用于观测多实例是否在正常领取）
-SELECT COUNT(*) AS leased_authors_now
-FROM author_sources
-WHERE lease_until IS NOT NULL AND lease_until > NOW();
+-- 最近 10 分钟被 fast crawler 更新过的文章
+SELECT COUNT(*) AS seen_articles_10m
+FROM articles
+WHERE last_seen_at >= NOW() - INTERVAL 10 MINUTE;
 ```
+
+### 逐步调参建议（一次只改一个变量）
+
+1. 先调 `FAST_CRAWL_MAX_PAGES_PER_CHANNEL_*`（每次 +10）
+2. 再调 `FAST_CRAWL_CONCURRENCY_*`（每次 +2）
+3. 每次调整后观察至少 1 个 10 分钟窗口
+4. 若 `avg_elapsed_seconds` 接近 interval、`rate_limited` 上升、`created_ratio` 下降，则回退
+
+### 加固项（已内置）
+
+- 多实例下新增 `conflict_retry` 统计：同一文章并发写入冲突会自动重试更新，减少整批回滚风险。
+- 新增 `FAST_CRAWL_STARTUP_JITTER_SECONDS` 与 `FAST_CRAWL_LOOP_JITTER_SECONDS`，用于多实例错峰，降低突发请求峰值。

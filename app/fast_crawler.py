@@ -17,7 +17,7 @@ from typing import Dict, List, Optional, Set
 import httpx
 from bs4 import BeautifulSoup
 from flask import Flask
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from .extensions import db
 from .models import Article
@@ -101,6 +101,10 @@ class FastCrawler:
         self.max_hours: float = float(cfg.get("FAST_CRAWL_MAX_HOURS", 24))
         self.request_delay: float = float(cfg.get("FAST_CRAWL_REQUEST_DELAY", 0.3))
         self.interval: int = int(cfg.get("FAST_CRAWL_INTERVAL_SECONDS", 300))
+        self.loop_jitter_seconds: int = max(0, int(cfg.get("FAST_CRAWL_LOOP_JITTER_SECONDS", 15)))
+        self.startup_jitter_seconds: int = max(
+            0, int(cfg.get("FAST_CRAWL_STARTUP_JITTER_SECONDS", 20))
+        )
         self.min_content_len: int = int(cfg.get("FAST_CRAWL_MIN_CONTENT_LENGTH", 80))
         self.max_fans: int = int(cfg.get("FAST_CRAWL_MAX_FANS", 0))
         self.block_keywords: List[str] = [
@@ -251,6 +255,45 @@ class FastCrawler:
     # Filter & Upsert
     # ------------------------------------------------------------------
 
+    def _apply_article_fields(
+        self,
+        article: Article,
+        *,
+        article_url: str,
+        url_hash: str,
+        title: str,
+        author: str,
+        media_user: Dict,
+        info: Dict,
+        feed_item: Dict,
+        publish_ts,
+        published_at: Optional[datetime],
+        now: datetime,
+        content_html: str,
+        followers: int,
+        view_count: int,
+        like_count: int,
+    ) -> None:
+        article.title = title[:255]
+        article.url = article_url
+        article.url_hash = url_hash
+        article.cover = _extract_first_image(content_html)
+        article.author = author
+        author_uid = media_user.get("id") or info.get("creator_uid") or ""
+        article.author_url = f"https://www.toutiao.com/c/user/token/{author_uid}/" if author_uid else ""
+        article.publish_time_text = str(publish_ts or "")
+        article.published_at = published_at or now
+        article.published_hours_ago = max(0.0, (now - (published_at or now)).total_seconds() / 3600)
+        if content_html and not content_html.strip().startswith("<article"):
+            content_html = f"<article>{content_html}</article>"
+
+        article.followers = followers
+        article.view_count = view_count
+        article.like_count = like_count
+        article.comment_count = int(info.get("comment_count") or feed_item.get("comments_count") or 0)
+        article.source_html = content_html
+        article.last_seen_at = now
+
     def _filter_and_upsert(self, feed_items: List[Dict], info_map: Dict[str, Dict]) -> int:
         """Synchronous DB operations inside Flask app context."""
         now = cn_now_naive()
@@ -268,6 +311,7 @@ class FastCrawler:
             "skip_content": 0,
             "skip_title": 0,
             "skip_no_engagement": 0,
+            "conflict_retry": 0,
             "created": 0,
             "updated": 0,
             "errors": 0,
@@ -346,46 +390,69 @@ class FastCrawler:
                 article_url = _normalize_article_url(gid)
                 url_hash = sha256_hex(article_url)
 
-                article = Article.query.filter(
-                    (Article.article_id == gid) | (Article.url_hash == url_hash)
-                ).first()
-                is_new = article is None
+                try:
+                    with db.session.begin_nested():
+                        article = Article.query.filter(
+                            (Article.article_id == gid) | (Article.url_hash == url_hash)
+                        ).first()
+                        is_new = article is None
+                        if is_new:
+                            article = Article(article_id=gid, url_hash=url_hash, url=article_url)
+                            db.session.add(article)
 
-                if is_new:
-                    article = Article(article_id=gid, url_hash=url_hash, url=article_url)
-                    db.session.add(article)
-                    stats["created"] += 1
-                else:
+                        self._apply_article_fields(
+                            article,
+                            article_url=article_url,
+                            url_hash=url_hash,
+                            title=title,
+                            author=author,
+                            media_user=media_user,
+                            info=info,
+                            feed_item=feed_item,
+                            publish_ts=publish_ts,
+                            published_at=published_at,
+                            now=now,
+                            content_html=content_html,
+                            followers=followers,
+                            view_count=view_count,
+                            like_count=like_count,
+                        )
+                        db.session.flush()
+
+                    if is_new:
+                        stats["created"] += 1
+                    else:
+                        stats["updated"] += 1
+                    affected += 1
+                except IntegrityError:
+                    # Another crawler may insert the same row first.
+                    stats["conflict_retry"] += 1
+                    with db.session.begin_nested():
+                        article = Article.query.filter(
+                            (Article.article_id == gid) | (Article.url_hash == url_hash)
+                        ).first()
+                        if not article:
+                            raise
+                        self._apply_article_fields(
+                            article,
+                            article_url=article_url,
+                            url_hash=url_hash,
+                            title=title,
+                            author=author,
+                            media_user=media_user,
+                            info=info,
+                            feed_item=feed_item,
+                            publish_ts=publish_ts,
+                            published_at=published_at,
+                            now=now,
+                            content_html=content_html,
+                            followers=followers,
+                            view_count=view_count,
+                            like_count=like_count,
+                        )
+                        db.session.flush()
                     stats["updated"] += 1
-
-                article.title = title[:255]
-                article.url = article_url
-                article.url_hash = url_hash
-                article.cover = _extract_first_image(content_html)
-                article.author = author
-                author_uid = media_user.get("id") or info.get("creator_uid") or ""
-                article.author_url = (
-                    f"https://www.toutiao.com/c/user/token/{author_uid}/"
-                    if author_uid else ""
-                )
-                article.publish_time_text = str(publish_ts or "")
-                article.published_at = published_at or now
-                article.published_hours_ago = max(
-                    0.0, (now - (published_at or now)).total_seconds() / 3600
-                )
-                # Wrap content in <article> tag for consistency with Selenium crawler
-                if content_html and not content_html.strip().startswith("<article"):
-                    content_html = f"<article>{content_html}</article>"
-
-                article.followers = followers
-                article.view_count = view_count
-                article.like_count = like_count
-                article.comment_count = int(
-                    info.get("comment_count") or feed_item.get("comments_count") or 0
-                )
-                article.source_html = content_html
-                article.last_seen_at = now
-                affected += 1
+                    affected += 1
 
             except Exception as exc:
                 stats["errors"] += 1
@@ -404,11 +471,12 @@ class FastCrawler:
         logger.info(
             "upsert summary candidates=%s info_ok=%s created=%s updated=%s "
             "skip_no_info=%s skip_micro=%s skip_video=%s skip_author=%s "
-            "skip_fans=%s skip_time=%s skip_engagement=%s skip_content=%s skip_title=%s errors=%s",
+            "skip_fans=%s skip_time=%s skip_engagement=%s skip_content=%s skip_title=%s "
+            "conflict_retry=%s errors=%s",
             stats["candidates"], stats["info_fetched"], stats["created"], stats["updated"],
             stats["skip_no_info"], stats["skip_micro"], stats["skip_video"], stats["skip_author"],
             stats["skip_fans"], stats["skip_time"], stats["skip_no_engagement"],
-            stats["skip_content"], stats["skip_title"], stats["errors"],
+            stats["skip_content"], stats["skip_title"], stats["conflict_retry"], stats["errors"],
         )
         return affected
 
@@ -474,10 +542,15 @@ class FastCrawler:
             "fast crawler loop started interval=%ss channels=%s concurrency=%s max_pages=%s",
             self.interval, self.channels, self.concurrency, self.max_pages,
         )
+        if self.startup_jitter_seconds > 0:
+            startup_sleep = random.uniform(0, float(self.startup_jitter_seconds))
+            logger.info("fast crawler startup jitter sleep %.1fs", startup_sleep)
+            await asyncio.sleep(startup_sleep)
         while True:
             try:
                 await self.run_once()
             except Exception as exc:
                 logger.exception("fast crawl loop error: %s", exc)
-            logger.info("fast crawl sleeping %ss", self.interval)
-            await asyncio.sleep(self.interval)
+            loop_sleep = self.interval + random.uniform(0, float(self.loop_jitter_seconds))
+            logger.info("fast crawl sleeping %.1fs", loop_sleep)
+            await asyncio.sleep(loop_sleep)

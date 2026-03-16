@@ -1,3 +1,25 @@
+x-fast-crawler-env: &fast_crawler_env
+  TZ: ${TZ:-Asia/Shanghai}
+  FAST_CRAWL_ENABLED: "true"
+  FAST_CRAWL_INTERVAL_SECONDS: ${FAST_CRAWL_INTERVAL_SECONDS:-300}
+  FAST_CRAWL_CONCURRENCY: ${FAST_CRAWL_CONCURRENCY:-10}
+  FAST_CRAWL_MAX_HOURS: ${FAST_CRAWL_MAX_HOURS:-24}
+  FAST_CRAWL_MAX_PAGES_PER_CHANNEL: ${FAST_CRAWL_MAX_PAGES_PER_CHANNEL:-50}
+  FAST_CRAWL_REQUEST_DELAY: ${FAST_CRAWL_REQUEST_DELAY:-0.3}
+  CRAWL_JOB_ENABLED: "false"
+  AUTHOR_COLLECT_JOB_ENABLED: "false"
+  AUTHOR_ARTICLES_JOB_ENABLED: "false"
+  CLEANUP_JOB_ENABLED: "false"
+  PYTHONUNBUFFERED: "1"
+
+x-fast-crawler-common: &fast_crawler_common
+  build:
+    context: .
+    dockerfile: Dockerfile.fast
+  restart: unless-stopped
+  env_file:
+    - .env
+
 services:
   api:
     build:
@@ -109,28 +131,62 @@ services:
   #     PYTHONUNBUFFERED: "1"
   #     DISPLAY: ":99"
 
+  # 单实例基线模式（默认）
   fast-crawler:
-    build:
-      context: .
-      dockerfile: Dockerfile.fast
-    container_name: jrtt-fast-crawler
-    restart: unless-stopped
-    env_file:
-      - .env
+    <<: *fast_crawler_common
+    profiles: ["fast-baseline"]
     environment:
-      TZ: ${TZ:-Asia/Shanghai}
-      FAST_CRAWL_ENABLED: "true"
-      FAST_CRAWL_INTERVAL_SECONDS: ${FAST_CRAWL_INTERVAL_SECONDS:-300}
+      <<: *fast_crawler_env
       FAST_CRAWL_CHANNELS: ${FAST_CRAWL_CHANNELS:-__all__,news_hot,news_tech,news_finance,news_entertainment,news_sports}
-      FAST_CRAWL_CONCURRENCY: ${FAST_CRAWL_CONCURRENCY:-10}
-      FAST_CRAWL_MAX_HOURS: ${FAST_CRAWL_MAX_HOURS:-24}
-      FAST_CRAWL_MAX_PAGES_PER_CHANNEL: ${FAST_CRAWL_MAX_PAGES_PER_CHANNEL:-50}
-      FAST_CRAWL_REQUEST_DELAY: ${FAST_CRAWL_REQUEST_DELAY:-0.3}
-      CRAWL_JOB_ENABLED: "false"
-      AUTHOR_COLLECT_JOB_ENABLED: "false"
-      AUTHOR_ARTICLES_JOB_ENABLED: "false"
       CLEANUP_JOB_ENABLED: "true"
-      PYTHONUNBUFFERED: "1"
+
+  # 灰度分片：先启动 3 个频道观察收益
+  fast-crawler-hot:
+    <<: *fast_crawler_common
+    profiles: ["fast-canary", "fast-full"]
+    environment:
+      <<: *fast_crawler_env
+      FAST_CRAWL_CHANNELS: news_hot
+      CLEANUP_JOB_ENABLED: "true"
+      FAST_CRAWL_CONCURRENCY: ${FAST_CRAWL_CONCURRENCY_HOT:-10}
+      FAST_CRAWL_MAX_PAGES_PER_CHANNEL: ${FAST_CRAWL_MAX_PAGES_PER_CHANNEL_HOT:-50}
+
+  fast-crawler-tech:
+    <<: *fast_crawler_common
+    profiles: ["fast-canary", "fast-full"]
+    environment:
+      <<: *fast_crawler_env
+      FAST_CRAWL_CHANNELS: news_tech
+      FAST_CRAWL_CONCURRENCY: ${FAST_CRAWL_CONCURRENCY_TECH:-10}
+      FAST_CRAWL_MAX_PAGES_PER_CHANNEL: ${FAST_CRAWL_MAX_PAGES_PER_CHANNEL_TECH:-50}
+
+  fast-crawler-finance:
+    <<: *fast_crawler_common
+    profiles: ["fast-canary", "fast-full"]
+    environment:
+      <<: *fast_crawler_env
+      FAST_CRAWL_CHANNELS: news_finance
+      FAST_CRAWL_CONCURRENCY: ${FAST_CRAWL_CONCURRENCY_FINANCE:-10}
+      FAST_CRAWL_MAX_PAGES_PER_CHANNEL: ${FAST_CRAWL_MAX_PAGES_PER_CHANNEL_FINANCE:-50}
+
+  # 全量分片：在灰度稳定后再开启剩余频道
+  fast-crawler-entertainment:
+    <<: *fast_crawler_common
+    profiles: ["fast-full"]
+    environment:
+      <<: *fast_crawler_env
+      FAST_CRAWL_CHANNELS: news_entertainment
+      FAST_CRAWL_CONCURRENCY: ${FAST_CRAWL_CONCURRENCY_ENTERTAINMENT:-10}
+      FAST_CRAWL_MAX_PAGES_PER_CHANNEL: ${FAST_CRAWL_MAX_PAGES_PER_CHANNEL_ENTERTAINMENT:-50}
+
+  fast-crawler-sports:
+    <<: *fast_crawler_common
+    profiles: ["fast-full"]
+    environment:
+      <<: *fast_crawler_env
+      FAST_CRAWL_CHANNELS: news_sports
+      FAST_CRAWL_CONCURRENCY: ${FAST_CRAWL_CONCURRENCY_SPORTS:-10}
+      FAST_CRAWL_MAX_PAGES_PER_CHANNEL: ${FAST_CRAWL_MAX_PAGES_PER_CHANNEL_SPORTS:-50}
 
   # import-authors:
   #   build:
