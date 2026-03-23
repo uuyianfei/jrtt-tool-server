@@ -361,7 +361,15 @@ def _rewrite_text(original_title: str, source_text: str, source_html: str):
             "6) 必须在 rewrittenBodyHtml 中使用 <img src=\"...\"> 插图，且 src 必须完全使用给定原图 URL，"
             "不要改写、不要替换、不要省略。\n"
             "7) 图片应尽量按原文位置对应插入到改写正文。\n"
-            "8) suggestedTitles 提供 3 个中文标题，单个标题建议控制在 24-30 个中文字符，风格有吸引力但不过度夸张。\n"
+            "8) suggestedTitles 必须提供 3 个标题，严格按“三段式”格式：第一段！第二段，第三段。\n"
+            "   - 第一段：极端钩子（瞬间抓人）\n"
+            "   - 第二段：对抗核心（交代事件）\n"
+            "   - 第三段：意外/情绪收尾（诱导点击）\n"
+            "   - 最重要：你不能使用任何举例里的词（包括但不限于“突发、破案了、扎心了、终于来了、凌晨、一夜、刚刚、130亿、1000人、99%”），\n"
+            "     必须根据文章特色重新命名表达，禁止套模板词。\n"
+            "   - 标题长度按以下规则严格控制在 20~30 字符：\n"
+            "     * 每个汉字=1；每个中文标点=1；每个英文字母/数字/英文标点=0.5。\n"
+            "   - 语言口语化但不低俗，避免“震惊、真相、不转不是中国人”等低质词。\n"
             "9) 改写内容必须完整通顺、无明显语病和错别字。\n"
             f"{image_guidance}\n"
             f"原标题：{original_title}\n"
@@ -402,9 +410,9 @@ def _rewrite_text(original_title: str, source_text: str, source_html: str):
         lines = ["原文内容为空，未能提取到正文。"]
     rewritten_html = "".join([f"<p>{line}</p>" for line in lines])
     titles = [
-        f"{original_title}：换个角度再看",
-        f"{original_title}：这几点最值得关注",
-        f"{original_title}：一个更好理解的版本",
+        _build_fallback_titles(original_title)[0],
+        _build_fallback_titles(original_title)[1],
+        _build_fallback_titles(original_title)[2],
     ]
     return rewritten_html, titles
 
@@ -473,22 +481,75 @@ def _normalize_titles(titles, original_title: str):
         text = re.sub(r"^[\-\d\.\)、\s]+", "", text)
         if _looks_like_json_fragment(text):
             continue
-        if text and text not in normalized:
+        if text and _is_valid_three_segment_title(text) and text not in normalized:
             normalized.append(text)
         if len(normalized) >= 3:
             break
     if len(normalized) < 3:
-        fallback = [
-            f"{original_title}：换个角度看真相",
-            f"{original_title}：3个最值得关注的点",
-            f"{original_title}：事情背后没那么简单",
-        ]
+        fallback = _build_fallback_titles(original_title)
         for t in fallback:
             if t not in normalized:
                 normalized.append(t)
             if len(normalized) >= 3:
                 break
     return normalized[:3]
+
+
+def _title_effective_length(text: str) -> float:
+    length = 0.0
+    for ch in (text or ""):
+        if re.match(r"[\u4e00-\u9fff]", ch):
+            length += 1.0
+        elif re.match(r"[，。！？：“”《》【】（）；、]", ch):
+            length += 1.0
+        else:
+            length += 0.5
+    return length
+
+
+def _is_valid_three_segment_title(text: str) -> bool:
+    if not text:
+        return False
+    # 必须满足：第一段！第二段，第三段
+    exclam = text.find("！")
+    comma = text.find("，")
+    if exclam <= 0 or comma <= exclam + 1:
+        return False
+
+    # 禁用通用模板词（用户明确要求）
+    banned = [
+        "突发",
+        "破案了",
+        "扎心了",
+        "终于来了",
+        "凌晨",
+        "一夜",
+        "刚刚",
+        "130亿",
+        "1000人",
+        "99%",
+        "震惊",
+        "不转不是中国人",
+    ]
+    if any(word in text for word in banned):
+        return False
+
+    eff_len = _title_effective_length(text)
+    return 20.0 <= eff_len <= 30.0
+
+
+def _build_fallback_titles(original_title: str):
+    topic = re.sub(r"[，。！？：“”《》【】（）；、\s]", "", str(original_title or "这件事"))[:8] or "这件事"
+    cands = [
+        f"夜里风向突变！{topic}正面硬刚争议，后续细节让人唏嘘",
+        f"现场线索对上了！{topic}回应全面摊开，结尾反转戳中痛点",
+        f"关键节点到了！{topic}最新动作落地，背后缘由令人沉默",
+        f"当事方终于表态！{topic}争议被摆上台面，结果走向超出预期",
+    ]
+    valid = [x for x in cands if _is_valid_three_segment_title(x)]
+    if len(valid) >= 3:
+        return valid[:3]
+    return cands[:3]
 
 
 def _normalize_html(html: str):
