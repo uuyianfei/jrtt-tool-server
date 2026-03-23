@@ -6,6 +6,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+from difflib import SequenceMatcher
 from urllib.parse import urlsplit
 
 import requests
@@ -23,6 +24,7 @@ from .utils import sha256_hex
 
 
 logger = logging.getLogger(__name__)
+MAX_REWRITE_SIMILARITY = 0.72
 
 
 def new_task_id() -> str:
@@ -66,13 +68,47 @@ def _rewrite_worker(app, task_id: str):
                 original_title=source_title,
                 source_text=source_text,
                 source_html=source_html,
+                force_rewrite=False,
             )
             rewritten_html, suggested_titles = _post_process_rewrite_output(
                 rewritten_html, suggested_titles, source_title
             )
+            similarity = _calc_text_similarity(_html_to_text(source_html), _html_to_text(rewritten_html))
+            if similarity >= MAX_REWRITE_SIMILARITY:
+                logger.warning(
+                    "rewrite similarity too high(%.3f), retrying task_id=%s",
+                    similarity,
+                    task_id,
+                )
+                rewritten_html2, suggested_titles2 = _run_with_timeout(
+                    _rewrite_text,
+                    timeout_seconds=ai_timeout,
+                    stage="rewrite_ai_retry",
+                    original_title=source_title,
+                    source_text=source_text,
+                    source_html=source_html,
+                    force_rewrite=True,
+                )
+                rewritten_html2, suggested_titles2 = _post_process_rewrite_output(
+                    rewritten_html2, suggested_titles2, source_title
+                )
+                similarity2 = _calc_text_similarity(_html_to_text(source_html), _html_to_text(rewritten_html2))
+                if similarity2 < similarity:
+                    rewritten_html, suggested_titles, similarity = (
+                        rewritten_html2,
+                        suggested_titles2,
+                        similarity2,
+                    )
+
             if not _is_meaningful_rewrite_html(rewritten_html):
                 logger.warning("rewrite html too short, fallback to source text task_id=%s", task_id)
                 rewritten_html = _build_rewrite_fallback_html(source_html, source_text)
+                similarity = _calc_text_similarity(_html_to_text(source_html), _html_to_text(rewritten_html))
+
+            if similarity >= MAX_REWRITE_SIMILARITY:
+                raise ValueError(
+                    f"改写结果与原文过于相似(similarity={similarity:.3f})，已阻止回传，请重试"
+                )
             rewritten_html = _inject_source_images(rewritten_html, source_html)
             time.sleep(1)
             _update_task(task, 95, "正在整理结果...", 1)
@@ -325,7 +361,7 @@ def _count_source_paragraphs(source_html: str, source_text: str) -> int:
     return len(text_lines)
 
 
-def _rewrite_text(original_title: str, source_text: str, source_html: str):
+def _rewrite_text(original_title: str, source_text: str, source_html: str, force_rewrite: bool = False):
     source_text = source_text[:3000]
     api_key = current_app.config["DEEPSEEK_API_KEY"]
     if api_key:
@@ -372,7 +408,12 @@ def _rewrite_text(original_title: str, source_text: str, source_html: str):
             "   - 语言口语化但不低俗，避免“震惊、真相、不转不是中国人”等低质词。\n"
             "9) 改写内容必须完整通顺、无明显语病和错别字。\n"
             f"{image_guidance}\n"
-            f"原标题：{original_title}\n"
+            + (
+                "10) 本次为“高相似重试模式”：必须比上一版更激进改写，优先重排段落顺序、改叙事角度、增删细节，禁止贴近原句。\n"
+                if force_rewrite
+                else ""
+            )
+            + f"原标题：{original_title}\n"
             f"原文：{source_text}"
         )
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
@@ -390,7 +431,7 @@ def _rewrite_text(original_title: str, source_text: str, source_html: str):
                 },
                 {"role": "user", "content": prompt},
             ],
-            "temperature": 0.8,
+            "temperature": 0.95 if force_rewrite else 0.8,
             "max_tokens": 1800,
         }
         resp = requests.post(
@@ -648,7 +689,33 @@ def _build_rewrite_fallback_html(source_html: str, source_text: str) -> str:
         lines = [line.strip() for line in (source_text or "").splitlines() if line.strip()][:20]
     if not lines:
         lines = ["原文提取成功，但改写结果异常，已启用兜底文本。"]
-    return "".join([f"<p>{html.escape(line)}</p>" for line in lines])
+
+    # 兜底不再原样回填原文，统一改为结构化摘要表达，降低“看起来就是原文”的概率。
+    paraphrased = []
+    for idx, line in enumerate(lines[:12], start=1):
+        cleaned = re.sub(r"\s+", " ", line).strip()
+        if not cleaned:
+            continue
+        if idx == 1:
+            paraphrased.append(f"这件事先从一个细节说起：{cleaned}")
+        elif idx % 3 == 0:
+            paraphrased.append(f"更值得注意的是，文中还提到：{cleaned}")
+        else:
+            paraphrased.append(f"从另一层看，关键信息是：{cleaned}")
+    if not paraphrased:
+        paraphrased = ["原文抓取成功，但改写结果异常，请稍后重试。"]
+    return "".join([f"<p>{html.escape(line)}</p>" for line in paraphrased])
+
+
+def _calc_text_similarity(source_text: str, rewritten_text: str) -> float:
+    src = re.sub(r"\s+", "", source_text or "")
+    dst = re.sub(r"\s+", "", rewritten_text or "")
+    if not src or not dst:
+        return 1.0
+    # 长度截断，避免极长文本影响性能
+    src = src[:4000]
+    dst = dst[:4000]
+    return float(SequenceMatcher(None, src, dst).ratio())
 
 
 def _build_image_guidance(source_html: str) -> str:
