@@ -1,4 +1,5 @@
-from sqlalchemy import JSON
+from sqlalchemy import JSON, ForeignKey
+from sqlalchemy.orm import relationship
 
 from .extensions import db
 from .time_utils import cn_now_naive
@@ -15,15 +16,18 @@ class Article(db.Model):
     cover = db.Column(db.String(1024), nullable=False, default="")
     author = db.Column(db.String(128), nullable=False, default="")
     author_url = db.Column(db.String(1024), nullable=False, default="")
+    author_id = db.Column(db.Integer, ForeignKey("author_sources.id"), nullable=True, index=True)
 
     publish_time_text = db.Column(db.String(64), nullable=False, default="")
     published_at = db.Column(db.DateTime, nullable=True, index=True)
     published_hours_ago = db.Column(db.Float, nullable=False, default=9999)
 
-    followers = db.Column(db.Integer, nullable=False, default=0, index=True)
     view_count = db.Column(db.Integer, nullable=False, default=0, index=True)
     like_count = db.Column(db.Integer, nullable=False, default=0, index=True)
     comment_count = db.Column(db.Integer, nullable=False, default=0, index=True)
+    metrics_status = db.Column(db.String(32), nullable=False, default="pending", index=True)
+    metrics_checked_at = db.Column(db.DateTime, nullable=True, index=True)
+    metrics_error = db.Column(db.String(512), nullable=False, default="")
 
     source_html = db.Column(db.Text, nullable=False, default="")
     created_at = db.Column(db.DateTime, nullable=False, default=cn_now_naive, index=True)
@@ -34,6 +38,7 @@ class Article(db.Model):
         onupdate=cn_now_naive,
     )
     last_seen_at = db.Column(db.DateTime, nullable=False, default=cn_now_naive, index=True)
+    author_ref = relationship("AuthorSource", foreign_keys=[author_id])
 
 
 class RewriteTask(db.Model):

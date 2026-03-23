@@ -20,7 +20,7 @@ from flask import Flask
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from .extensions import db
-from .models import Article
+from .models import Article, AuthorSource
 from .time_utils import SHANGHAI_TZ, cn_now_naive
 from .utils import sha256_hex
 
@@ -85,6 +85,23 @@ def _extract_first_image(content_html: str) -> str:
     if url.startswith("//"):
         url = f"https:{url}"
     return url
+
+
+def _normalize_author_url(feed_item: Dict, media_user: Dict, info: Dict) -> str:
+    """Prefer feed media_url (real token URL) over numeric IDs."""
+    media_url = str(feed_item.get("media_url") or "").strip()
+    if media_url:
+        if media_url.startswith("//"):
+            media_url = f"https:{media_url}"
+        elif media_url.startswith("/"):
+            media_url = f"https://www.toutiao.com{media_url}"
+        elif media_url.startswith("http://"):
+            media_url = f"https://{media_url[len('http://'):]}"
+        return media_url.split("#")[0].strip()
+
+    author_uid = media_user.get("id") or info.get("creator_uid") or ""
+    author_uid = str(author_uid).strip()
+    return f"https://www.toutiao.com/c/user/token/{author_uid}/" if author_uid else ""
 
 
 class FastCrawler:
@@ -263,14 +280,13 @@ class FastCrawler:
         url_hash: str,
         title: str,
         author: str,
-        media_user: Dict,
-        info: Dict,
-        feed_item: Dict,
+        author_url: str,
+        author_id: Optional[int],
         publish_ts,
         published_at: Optional[datetime],
         now: datetime,
         content_html: str,
-        followers: int,
+        comment_count: int,
         view_count: int,
         like_count: int,
     ) -> None:
@@ -279,20 +295,22 @@ class FastCrawler:
         article.url_hash = url_hash
         article.cover = _extract_first_image(content_html)
         article.author = author
-        author_uid = media_user.get("id") or info.get("creator_uid") or ""
-        article.author_url = f"https://www.toutiao.com/c/user/token/{author_uid}/" if author_uid else ""
+        article.author_url = author_url
+        article.author_id = author_id
         article.publish_time_text = str(publish_ts or "")
         article.published_at = published_at or now
         article.published_hours_ago = max(0.0, (now - (published_at or now)).total_seconds() / 3600)
         if content_html and not content_html.strip().startswith("<article"):
             content_html = f"<article>{content_html}</article>"
 
-        article.followers = followers
         article.view_count = view_count
         article.like_count = like_count
-        article.comment_count = int(info.get("comment_count") or feed_item.get("comments_count") or 0)
+        article.comment_count = int(comment_count or 0)
         article.source_html = content_html
         article.last_seen_at = now
+        article.metrics_status = "pending"
+        article.metrics_checked_at = None
+        article.metrics_error = ""
 
     def _filter_and_upsert(self, feed_items: List[Dict], info_map: Dict[str, Dict]) -> int:
         """Synchronous DB operations inside Flask app context."""
@@ -350,10 +368,9 @@ class FastCrawler:
 
                 # Fan count filter
                 media_user = info.get("media_user") or {}
-                followers = int(media_user.get("follower_count") or info.get("follower_count") or 0)
-                if self.max_fans > 0 and followers >= self.max_fans:
-                    stats["skip_fans"] += 1
-                    continue
+                api_followers = int(media_user.get("follower_count") or info.get("follower_count") or 0)
+                author_url = _normalize_author_url(feed_item, media_user, info)
+                author_name = str(media_user.get("screen_name") or author or "").strip()
 
                 # Publish time filter
                 publish_ts = info.get("publish_time")
@@ -373,6 +390,7 @@ class FastCrawler:
                 # Engagement filter: skip articles with 0 reads or 0 likes
                 view_count = int(info.get("impression_count") or 0)
                 like_count = int(info.get("digg_count") or 0)
+                comment_count = int(info.get("comment_count") or feed_item.get("comments_count") or 0)
                 if view_count <= 0 or like_count <= 0:
                     stats["skip_no_engagement"] += 1
                     continue
@@ -392,6 +410,32 @@ class FastCrawler:
 
                 try:
                     with db.session.begin_nested():
+                        author_row: Optional[AuthorSource] = None
+                        if author_url:
+                            author_row = AuthorSource.query.filter(AuthorSource.author_url == author_url).first()
+                            if author_row is None:
+                                author_row = AuthorSource(
+                                    author_url=author_url,
+                                    author_name=author_name or author,
+                                    first_seen_at=now,
+                                )
+                                db.session.add(author_row)
+                                db.session.flush()
+                            else:
+                                if author_name:
+                                    author_row.author_name = author_name
+                            author_row.last_seen_at = now
+                            # Fast lane only seeds followers if empty; accurate value comes from reconcile job.
+                            if int(author_row.followers or 0) <= 0 and api_followers > 0:
+                                author_row.followers = int(api_followers)
+
+                        candidate_fans = int(api_followers)
+                        if author_row and int(author_row.followers or 0) > 0:
+                            candidate_fans = int(author_row.followers or 0)
+                        if self.max_fans > 0 and candidate_fans >= self.max_fans:
+                            stats["skip_fans"] += 1
+                            continue
+
                         article = Article.query.filter(
                             (Article.article_id == gid) | (Article.url_hash == url_hash)
                         ).first()
@@ -406,14 +450,13 @@ class FastCrawler:
                             url_hash=url_hash,
                             title=title,
                             author=author,
-                            media_user=media_user,
-                            info=info,
-                            feed_item=feed_item,
+                            author_url=author_url,
+                            author_id=(author_row.id if author_row else None),
                             publish_ts=publish_ts,
                             published_at=published_at,
                             now=now,
                             content_html=content_html,
-                            followers=followers,
+                            comment_count=comment_count,
                             view_count=view_count,
                             like_count=like_count,
                         )
@@ -428,6 +471,24 @@ class FastCrawler:
                     # Another crawler may insert the same row first.
                     stats["conflict_retry"] += 1
                     with db.session.begin_nested():
+                        author_row: Optional[AuthorSource] = None
+                        if author_url:
+                            author_row = AuthorSource.query.filter(AuthorSource.author_url == author_url).first()
+                            if author_row is None:
+                                author_row = AuthorSource(
+                                    author_url=author_url,
+                                    author_name=author_name or author,
+                                    first_seen_at=now,
+                                )
+                                db.session.add(author_row)
+                                db.session.flush()
+                            else:
+                                if author_name:
+                                    author_row.author_name = author_name
+                            author_row.last_seen_at = now
+                            if int(author_row.followers or 0) <= 0 and api_followers > 0:
+                                author_row.followers = int(api_followers)
+
                         article = Article.query.filter(
                             (Article.article_id == gid) | (Article.url_hash == url_hash)
                         ).first()
@@ -439,14 +500,13 @@ class FastCrawler:
                             url_hash=url_hash,
                             title=title,
                             author=author,
-                            media_user=media_user,
-                            info=info,
-                            feed_item=feed_item,
+                            author_url=author_url,
+                            author_id=(author_row.id if author_row else None),
                             publish_ts=publish_ts,
                             published_at=published_at,
                             now=now,
                             content_html=content_html,
-                            followers=followers,
+                            comment_count=comment_count,
                             view_count=view_count,
                             like_count=like_count,
                         )

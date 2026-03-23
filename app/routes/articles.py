@@ -5,7 +5,7 @@ from flask import Blueprint, request
 from flask import send_file
 from openpyxl import Workbook
 
-from ..models import Article
+from ..models import Article, AuthorSource
 from ..time_utils import cn_now_naive
 from ..utils import error_response, format_compact_number, success_response
 
@@ -39,7 +39,10 @@ def _build_filtered_query(body):
         return None, error_response(4001, "sortOrder 仅支持 asc|desc")
 
     now = cn_now_naive()
-    q = Article.query.filter(Article.published_at >= now - timedelta(hours=24))
+    q = Article.query.join(AuthorSource, Article.author_id == AuthorSource.id).filter(
+        Article.metrics_status == "checked",
+        Article.published_at >= now - timedelta(hours=24),
+    )
     if max_hours is not None:
         try:
             max_hours = float(max_hours)
@@ -47,13 +50,13 @@ def _build_filtered_query(body):
         except (ValueError, TypeError):
             return None, error_response(4001, "maxPublishedHours 参数无效")
 
-    q = _apply_numeric_filter(q, Article.followers, body.get("followerFilter"))
+    q = _apply_numeric_filter(q, AuthorSource.followers, body.get("followerFilter"))
     q = _apply_numeric_filter(q, Article.view_count, body.get("viewFilter"))
     q = _apply_numeric_filter(q, Article.like_count, body.get("likeFilter"))
     q = _apply_numeric_filter(q, Article.comment_count, body.get("commentFilter"))
 
     if sort_field == "followers":
-        sort_col = Article.followers
+        sort_col = AuthorSource.followers
     elif sort_field == "views":
         sort_col = Article.view_count
     else:
@@ -103,7 +106,7 @@ def search_articles():
                 "views": format_compact_number(row.view_count),
                 "time": _format_publish_time(hours_ago),
                 "link": row.url,
-                "followers": row.followers,
+                "followers": int((row.author_ref.followers if row.author_ref else 0) or 0),
                 "viewCount": row.view_count,
                 "likeCount": row.like_count,
                 "commentCount": row.comment_count,
@@ -146,6 +149,7 @@ def export_articles():
             "点赞数",
             "评论数",
             "发布时间",
+            "创建时间",
         ]
     )
 
@@ -160,11 +164,12 @@ def export_articles():
                 row.title or "",
                 row.url or "",
                 row.author or "",
-                int(row.followers or 0),
+                int((row.author_ref.followers if row.author_ref else 0) or 0),
                 int(row.view_count or 0),
                 int(row.like_count or 0),
                 int(row.comment_count or 0),
                 published_at.strftime("%Y-%m-%d %H:%M:%S"),
+                (row.created_at or now).strftime("%Y-%m-%d %H:%M:%S"),
             ]
         )
 

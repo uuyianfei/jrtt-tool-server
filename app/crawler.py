@@ -1340,10 +1340,29 @@ def upsert_articles(
             article.cover = base.get("cover", "")
             article.author = base.get("author", "")
             article.author_url = base.get("author_url", "")
+            author_row = None
+            if article.author_url:
+                author_row = AuthorSource.query.filter(AuthorSource.author_url == article.author_url).first()
+                if author_row is None:
+                    author_row = AuthorSource(
+                        author_url=article.author_url,
+                        author_name=(article.author or ""),
+                        followers=int(fans or 0),
+                        first_seen_at=now,
+                    )
+                    db.session.add(author_row)
+                    db.session.flush()
+                else:
+                    if article.author:
+                        author_row.author_name = article.author
+                    if int(fans or 0) > 0:
+                        author_row.followers = int(fans)
+                author_row.last_seen_at = now
+                author_row.last_error = ""
+            article.author_id = (author_row.id if author_row else None)
             article.publish_time_text = item.get("publish_time_text") or base.get("publish_time", "")
             article.published_at = published_at
             article.published_hours_ago = max(0.0, (now - published_at).total_seconds() / 3600)
-            article.followers = int(fans)
             # 阅读量只采用作者主页作品卡片值（详情页无可靠阅读量）
             article.view_count = int(read_count or 0)
             article.like_count = int(details.get("like_count") or 0)
@@ -1356,12 +1375,15 @@ def upsert_articles(
             if html_is_meaningful:
                 article.source_html = article_html
             article.last_seen_at = now
+            article.metrics_status = "checked"
+            article.metrics_checked_at = now
+            article.metrics_error = ""
             affected += 1
             logger.info(
                 "upsert success article_id=%s mode=%s fans=%s views=%s likes=%s comments=%s (read_from_author=%s)",
                 article_id,
                 "create" if is_new else "update",
-                article.followers,
+                int(fans or 0),
                 article.view_count,
                 article.like_count,
                 article.comment_count,
