@@ -4,6 +4,7 @@ from io import BytesIO
 from flask import Blueprint, request
 from flask import send_file
 from openpyxl import Workbook
+from sqlalchemy import func
 
 from ..models import Article, AuthorSource
 from ..time_utils import cn_now_naive
@@ -39,7 +40,10 @@ def _build_filtered_query(body):
         return None, error_response(4001, "sortOrder 仅支持 asc|desc")
 
     now = cn_now_naive()
-    q = Article.query.join(AuthorSource, Article.author_id == AuthorSource.id).filter(
+    # 用 LEFT JOIN 避免 author_id 未回填/作者表缺失时导致“查不到”checked 数据
+    # followers 优先取 author_sources，其次回退到 articles.followers（兼容旧数据）
+    followers_col = func.coalesce(AuthorSource.followers, Article.followers, 0)
+    q = Article.query.outerjoin(AuthorSource, Article.author_id == AuthorSource.id).filter(
         Article.metrics_status == "checked",
         Article.published_at >= now - timedelta(hours=24),
     )
@@ -50,13 +54,13 @@ def _build_filtered_query(body):
         except (ValueError, TypeError):
             return None, error_response(4001, "maxPublishedHours 参数无效")
 
-    q = _apply_numeric_filter(q, AuthorSource.followers, body.get("followerFilter"))
+    q = _apply_numeric_filter(q, followers_col, body.get("followerFilter"))
     q = _apply_numeric_filter(q, Article.view_count, body.get("viewFilter"))
     q = _apply_numeric_filter(q, Article.like_count, body.get("likeFilter"))
     q = _apply_numeric_filter(q, Article.comment_count, body.get("commentFilter"))
 
     if sort_field == "followers":
-        sort_col = AuthorSource.followers
+        sort_col = followers_col
     elif sort_field == "views":
         sort_col = Article.view_count
     else:
@@ -106,7 +110,14 @@ def search_articles():
                 "views": format_compact_number(row.view_count),
                 "time": _format_publish_time(hours_ago),
                 "link": row.url,
-                "followers": int((row.author_ref.followers if row.author_ref else 0) or 0),
+                "followers": int(
+                    (
+                        (row.author_ref.followers if row.author_ref and row.author_ref.followers is not None else None)
+                        or row.followers
+                        or 0
+                    )
+                    or 0
+                ),
                 "viewCount": row.view_count,
                 "likeCount": row.like_count,
                 "commentCount": row.comment_count,
@@ -164,7 +175,14 @@ def export_articles():
                 row.title or "",
                 row.url or "",
                 row.author or "",
-                int((row.author_ref.followers if row.author_ref else 0) or 0),
+                        int(
+                            (
+                                (row.author_ref.followers if row.author_ref and row.author_ref.followers is not None else None)
+                                or row.followers
+                                or 0
+                            )
+                            or 0
+                        ),
                 int(row.view_count or 0),
                 int(row.like_count or 0),
                 int(row.comment_count or 0),

@@ -3,11 +3,12 @@ import json
 import csv
 import re
 import time
+import os
 from datetime import datetime
 from urllib.parse import urlparse, parse_qs
 from selenium import webdriver
-from selenium.webdriver.edge.service import Service as EdgeService
-from selenium.webdriver.edge.options import Options as EdgeOptions
+from selenium.webdriver.chrome.service import Service as ChromeService
+from selenium.webdriver.chrome.options import Options as ChromeOptions
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
@@ -20,8 +21,8 @@ OUTPUT_FILE = f"toutiao_articles_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
 ENABLE_PAGINATION = False                  # 是否翻页（通常关闭）
 MAX_PAGES = 3                              # 最大翻页数
 
-# Edge Driver 本地路径（请根据实际路径修改）
-EDGE_DRIVER_PATH = r"D:\Edge\edgedriver_win64\msedgedriver.exe"
+# Chrome Driver 本地路径（可选；不存在时将自动下载）
+CHROME_DRIVER_PATH = r""
 HEADLESS = True                            # 无头模式（不显示浏览器窗口）
 # ================================
 
@@ -32,6 +33,28 @@ profile_cache = {}
 def read_curl_from_file(filepath):
     with open(filepath, 'r', encoding='utf-8') as f:
         return f.read().strip()
+
+
+def resolve_chrome_driver_path() -> str | None:
+    """
+    优先使用本地 CHROME_DRIVER_PATH；不存在时尝试 webdriver-manager 自动下载。
+    返回 None 表示交由 Selenium Manager/默认逻辑处理。
+    """
+    if CHROME_DRIVER_PATH and os.path.exists(CHROME_DRIVER_PATH):
+        return CHROME_DRIVER_PATH
+
+    # webdriver-manager 在 requirements.txt 里已加入，这里做兜底。
+    try:
+        from webdriver_manager.chrome import ChromeDriverManager
+
+        return ChromeDriverManager().install()
+    except ModuleNotFoundError:
+        # 当前环境可能未安装 webdriver-manager；此时直接返回 None，让 Selenium Manager/默认逻辑处理。
+        return None
+    except Exception as e:
+        print(f"[浏览器] 本地 Chrome driver 不存在，且自动安装失败：{e}")
+        return None
+
 
 def parse_curl(curl_cmd):
     """解析 cURL 命令，返回 (base_url, headers, cookies, params)"""
@@ -101,7 +124,7 @@ class AuthorCrawler:
         self._init_browser()
 
     def _init_browser(self):
-        options = EdgeOptions()
+        options = ChromeOptions()
         options.page_load_strategy = 'eager'
         if self.headless:
             options.add_argument("--headless")
@@ -114,11 +137,16 @@ class AuthorCrawler:
         options.add_argument("--lang=zh-CN")
         # 隐藏自动化特征
         options.add_argument("--incognito")
-        user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 Edg/122.0.0.0"
+        user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
         options.add_argument(f'--user-agent={user_agent}')
 
-        service = EdgeService(executable_path=self.driver_path)
-        driver = webdriver.Edge(service=service, options=options)
+        driver_path = self.driver_path if self.driver_path and os.path.exists(self.driver_path) else resolve_chrome_driver_path()
+        if not driver_path:
+            print("[浏览器] Chrome driver 路径未能解析到，将让 Selenium 自行处理。")
+            service = ChromeService()
+        else:
+            service = ChromeService(executable_path=driver_path)
+        driver = webdriver.Chrome(service=service, options=options)
 
         # 注入反检测脚本
         driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
@@ -245,13 +273,24 @@ def get_author_stats(uid):
     """对外接口：获取作者粉丝数和获赞数（带缓存）"""
     if uid in profile_cache:
         return profile_cache[uid]  # 返回 (fans, digg, name, url)
-    crawler = AuthorCrawler(headless=HEADLESS, driver_path=EDGE_DRIVER_PATH)
+
+    crawler = None
     try:
+        crawler = AuthorCrawler(headless=HEADLESS, driver_path=CHROME_DRIVER_PATH)
         fans, digg, name, url = crawler.get_author_stats(uid)
         profile_cache[uid] = (fans, digg, name, url)
         return fans, digg, name, url
+    except Exception as e:
+        # 驱动初始化失败时，也要保证 Feed 解析能继续进行（作者统计置 0）。
+        print(f"[浏览器] 获取作者信息失败（回退为 0）：{e}")
+        profile_cache[uid] = (0, 0, "未知", None)
+        return 0, 0, "未知", None
     finally:
-        crawler.close()
+        try:
+            if crawler:
+                crawler.close()
+        except Exception:
+            pass
 
 def timestamp_to_str(ts):
     return datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S') if ts else ''
@@ -314,7 +353,9 @@ def parse_article(item):
     }
 
 def is_article(item):
-    return item.get('has_video') is False and item.get('cell_type') != 48
+    # 兼容字段缺失/数值化：有的接口不返回 has_video，而有的返回 0/1。
+    has_video = item.get('has_video', False)
+    return (not bool(has_video)) and item.get('cell_type') != 48
 
 def main():
     print("从文件中读取 Feed cURL 命令...")

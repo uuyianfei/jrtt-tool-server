@@ -91,6 +91,22 @@ def normalize_article_url(url: str) -> str:
     return urlunsplit((scheme, netloc, path, "", ""))
 
 
+def normalize_author_url(url: str) -> str:
+    if not url:
+        return ""
+    raw = str(url).strip()
+    if raw.startswith("//"):
+        raw = f"https:{raw}"
+    if raw.startswith("/"):
+        raw = f"https://www.toutiao.com{raw}"
+
+    parts = urlsplit(raw)
+    scheme = parts.scheme or "https"
+    netloc = parts.netloc or "www.toutiao.com"
+    path = (parts.path or "").rstrip("/")
+    return urlunsplit((scheme, netloc, path, "", ""))
+
+
 def sanitize_article_url_for_storage(url: str) -> str:
     clean = normalize_article_url(url)
     if not clean:
@@ -479,6 +495,49 @@ class ToutiaoCrawler:
         except Exception as exc:
             logger.warning("extract article info failed: %s", exc)
             return None
+
+    def _extract_author_info_from_article_page(self, article_url: str) -> Dict[str, str]:
+        """
+        从文章详情页解析作者链接（/c/user/），用于补齐 Article.author_url/author_id。
+        """
+        if not article_url:
+            return {"author_name": "", "author_url": ""}
+        try:
+            self._safe_get(article_url)
+            time.sleep(1.0)  # 等待作者区域/脚本渲染
+            soup = BeautifulSoup(self._safe_page_source(), "html.parser")
+
+            user_info = soup.select_one("div.user-info")
+            author_name_a = None
+            author_url_a = None
+            if user_info:
+                author_name_a = user_info.select_one('a.user-name[href]')
+                author_url_a = user_info.select_one('a.user-name[href]') or user_info.select_one('a.user-avatar[href]')
+
+            # 兜底：任意命中 /c/user/ 的 a
+            if not author_url_a:
+                author_url_a = soup.select_one('a[href*="/c/user/"]')
+            if not author_url_a:
+                for a in soup.find_all("a", href=True):
+                    href = (a.get("href") or "").strip()
+                    if "/c/user/" in href:
+                        author_url_a = a
+                        break
+            if not author_url_a:
+                return {"author_name": "", "author_url": ""}
+
+            href = (author_url_a.get("href") or "").strip()
+            if href.startswith("//"):
+                href = f"https:{href}"
+            elif href.startswith("/"):
+                href = f"https://www.toutiao.com{href}"
+
+            author_url = normalize_author_url(href)
+            author_name = (author_name_a.get_text(strip=True) if author_name_a else author_url_a.get_text(strip=True) if author_url_a else "").strip()
+            return {"author_name": author_name[:128], "author_url": author_url}
+        except Exception as exc:
+            logger.warning("extract author from article failed url=%s err=%s", article_url, exc)
+            return {"author_name": "", "author_url": ""}
 
     def _get_author_fans_count(self, author_url: str) -> int:
         if not author_url:

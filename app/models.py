@@ -25,6 +25,9 @@ class Article(db.Model):
     view_count = db.Column(db.Integer, nullable=False, default=0, index=True)
     like_count = db.Column(db.Integer, nullable=False, default=0, index=True)
     comment_count = db.Column(db.Integer, nullable=False, default=0, index=True)
+    # Backward-compat: 旧版表结构可能仍保留 articles.followers。
+    # 当 author_id 未能关联到 author_sources 时，列表接口需要用它兜底展示。
+    followers = db.Column(db.Integer, nullable=False, default=0, index=True)
     metrics_status = db.Column(db.String(32), nullable=False, default="pending", index=True)
     metrics_checked_at = db.Column(db.DateTime, nullable=True, index=True)
     metrics_error = db.Column(db.String(512), nullable=False, default="")

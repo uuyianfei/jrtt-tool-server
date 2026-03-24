@@ -53,12 +53,19 @@ services:
     environment:
       TZ: ${TZ:-Asia/Shanghai}
       PYTHONUNBUFFERED: "1"
+      CRAWL_HEADLESS: "false"
+      CHROMEDRIVER_PATH: ${CHROMEDRIVER_PATH:-/usr/bin/chromedriver}
+      CHROME_BINARY_PATH: ${CHROME_BINARY_PATH:-/usr/bin/chromium}
       METRICS_RECONCILE_ENABLED: "true"
       METRICS_RECONCILE_INTERVAL_SECONDS: ${METRICS_RECONCILE_INTERVAL_SECONDS:-60}
       METRICS_RECONCILE_BATCH_SIZE: ${METRICS_RECONCILE_BATCH_SIZE:-30}
       METRICS_RECONCILE_MAX_HOURS: ${METRICS_RECONCILE_MAX_HOURS:-24}
       METRICS_RECONCILE_REQUEST_DELAY: ${METRICS_RECONCILE_REQUEST_DELAY:-0.25}
     command:
+      - xvfb-run
+      - -a
+      - -s
+      - -screen 0 1920x1080x24
       - python
       - tools/reconcile_article_metrics.py
       - --loop
