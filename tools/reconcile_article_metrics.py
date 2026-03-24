@@ -61,6 +61,77 @@ def pick_pending_articles(batch_size: int, max_hours: float) -> List[Article]:
     )
 
 
+def pick_checked_articles_for_refresh(batch_size: int, max_hours: float) -> List[Article]:
+    now = cn_now_naive()
+    cutoff = now - timedelta(hours=max(0.0, float(max_hours)))
+    return (
+        Article.query.filter(
+            Article.metrics_status == "checked",
+            Article.published_at >= cutoff,
+        )
+        .order_by(
+            Article.metrics_checked_at.is_(None).desc(),
+            Article.metrics_checked_at.asc(),
+            Article.id.asc(),
+        )
+        .limit(max(1, int(batch_size)))
+        .all()
+    )
+
+
+def reconcile_checked_once(
+    batch_size: int,
+    max_hours: float,
+    request_delay: float,
+) -> Dict[str, int]:
+    rows = pick_checked_articles_for_refresh(batch_size=batch_size, max_hours=max_hours)
+    if not rows:
+        return {"picked": 0, "checked_refreshed": 0, "failed": 0}
+
+    now = cn_now_naive()
+    checked_refreshed = 0
+    failed = 0
+    try:
+        for row in rows:
+            gid = str(row.article_id or "").strip()
+            if not gid:
+                failed += 1
+                continue
+            try:
+                info = fetch_info_api(gid)
+                if not info:
+                    failed += 1
+                    continue
+
+                row.view_count = int(info.get("impression_count") or row.view_count or 0)
+                row.like_count = int(info.get("digg_count") or row.like_count or 0)
+                row.comment_count = int(
+                    max(
+                        int(info.get("comment_count") or 0),
+                        int(row.comment_count or 0),
+                    )
+                )
+                # checked 刷新模式：保持 checked，只更新校准时间
+                row.metrics_status = "checked"
+                row.metrics_checked_at = now
+                row.metrics_error = ""
+                checked_refreshed += 1
+            except Exception:
+                failed += 1
+            finally:
+                time.sleep(max(0.0, float(request_delay)))
+
+        db.session.commit()
+        return {
+            "picked": len(rows),
+            "checked_refreshed": checked_refreshed,
+            "failed": failed,
+        }
+    except Exception:
+        db.session.rollback()
+        raise
+
+
 def reconcile_once(
     batch_size: int,
     max_hours: float,
@@ -232,6 +303,12 @@ def reconcile_once(
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Reconcile article metrics and author followers")
+    parser.add_argument(
+        "--mode",
+        choices=["pending", "checked-refresh"],
+        default="pending",
+        help="pending: reconcile pending rows; checked-refresh: continuously refresh checked rows",
+    )
     parser.add_argument("--batch-size", type=int, default=30)
     parser.add_argument("--max-hours", type=float, default=24)
     parser.add_argument("--request-delay", type=float, default=0.25)
@@ -243,28 +320,42 @@ def main() -> int:
     with app.app_context():
         headless = bool(app.config.get("CRAWL_HEADLESS", True))
         app.logger.info(
-            "reconcile worker started loop=%s batch_size=%s max_hours=%s headless=%s",
+            "reconcile worker started mode=%s loop=%s batch_size=%s max_hours=%s headless=%s",
+            str(args.mode),
             bool(args.loop),
             int(args.batch_size),
             float(args.max_hours),
             bool(headless),
         )
         while True:
-            stats = reconcile_once(
-                batch_size=int(args.batch_size),
-                max_hours=float(args.max_hours),
-                request_delay=float(args.request_delay),
-                headless=headless,
-            )
-            app.logger.info(
-                "reconcile done picked=%s checked=%s failed=%s authors_updated=%s pending_author_followers_unavailable=%s authors_mapped=%s",
-                stats["picked"],
-                stats["checked"],
-                stats["failed"],
-                stats["authors_updated"],
-                stats.get("pending_author_followers_unavailable", 0),
-                stats.get("authors_mapped", 0),
-            )
+            if str(args.mode) == "checked-refresh":
+                stats = reconcile_checked_once(
+                    batch_size=int(args.batch_size),
+                    max_hours=float(args.max_hours),
+                    request_delay=float(args.request_delay),
+                )
+                app.logger.info(
+                    "reconcile checked-refresh done picked=%s checked_refreshed=%s failed=%s",
+                    stats["picked"],
+                    stats["checked_refreshed"],
+                    stats["failed"],
+                )
+            else:
+                stats = reconcile_once(
+                    batch_size=int(args.batch_size),
+                    max_hours=float(args.max_hours),
+                    request_delay=float(args.request_delay),
+                    headless=headless,
+                )
+                app.logger.info(
+                    "reconcile pending done picked=%s checked=%s failed=%s authors_updated=%s pending_author_followers_unavailable=%s authors_mapped=%s",
+                    stats["picked"],
+                    stats["checked"],
+                    stats["failed"],
+                    stats["authors_updated"],
+                    stats.get("pending_author_followers_unavailable", 0),
+                    stats.get("authors_mapped", 0),
+                )
             if not args.loop:
                 break
             time.sleep(max(5, int(args.interval_seconds)))
