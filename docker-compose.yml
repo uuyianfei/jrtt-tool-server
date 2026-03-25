@@ -46,7 +46,6 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.fast
-    container_name: jrtt-metrics-reconcile
     restart: unless-stopped
     env_file:
       - .env

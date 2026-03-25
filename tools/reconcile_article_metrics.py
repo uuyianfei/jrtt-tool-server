@@ -28,6 +28,7 @@ from app.time_utils import cn_now_naive
 
 INFO_API_URL = "https://m.toutiao.com/i{gid}/info/"
 CHECKED_REFRESH_CLAIM_ERROR = "checked-refreshing"
+PENDING_REFRESH_CLAIM_ERROR = "pending-refreshing"
 
 
 def fetch_info_api(gid: str, timeout: int = 15) -> Dict:
@@ -61,6 +62,80 @@ def pick_pending_articles(batch_size: int, max_hours: float) -> List[Article]:
         .limit(max(1, int(batch_size)))
         .all()
     )
+
+
+def claim_pending_articles_for_refresh(
+    batch_size: int,
+    max_hours: float,
+    stale_seconds: int = 300,
+) -> List[Article]:
+    """
+    Strict non-duplicate across multiple workers (pending mode).
+    Claim rows before doing HTTP calls:
+    - eligible: metrics_status != checked, published_at within window
+    - exclude claimed rows unless their updated_at is stale
+    - set metrics_error to PENDING_REFRESH_CLAIM_ERROR
+    """
+    now = cn_now_naive()
+    cutoff = now - timedelta(hours=max(0.0, float(max_hours)))
+    stale_cutoff = now - timedelta(seconds=max(0, int(stale_seconds)))
+    limit = max(1, int(batch_size))
+
+    # eligibility predicate (stale claim rows can be re-claimed)
+    eligible = (
+        (Article.metrics_status != "checked")
+        & (Article.published_at >= cutoff)
+        & (
+            (Article.metrics_error != PENDING_REFRESH_CLAIM_ERROR)
+            | (Article.updated_at <= stale_cutoff)
+        )
+    )
+
+    # Preferred path: SELECT ... FOR UPDATE SKIP LOCKED
+    try:
+        q = (
+            db.session.query(Article)
+            .filter(eligible)
+            .order_by(Article.published_at.desc(), Article.id.desc())
+            .with_for_update(skip_locked=True)
+            .limit(limit)
+        )
+        rows: List[Article] = q.all()
+        if not rows:
+            return []
+        for row in rows:
+            row.metrics_error = PENDING_REFRESH_CLAIM_ERROR
+        db.session.commit()
+        return rows
+    except Exception:
+        # Fallback: conditional UPDATE to ensure exclusivity
+        candidate_ids = (
+            db.session.query(Article.id)
+            .filter(eligible)
+            .order_by(Article.published_at.desc(), Article.id.desc())
+            .limit(limit * 5)
+            .all()
+        )
+        claimed_ids: List[int] = []
+        for (row_id,) in candidate_ids:
+            updated = (
+                db.session.query(Article)
+                .filter(Article.id == row_id)
+                .filter(
+                    (Article.metrics_error != PENDING_REFRESH_CLAIM_ERROR)
+                    | (Article.updated_at <= stale_cutoff)
+                )
+                .update({"metrics_error": PENDING_REFRESH_CLAIM_ERROR}, synchronize_session=False)
+            )
+            if int(updated or 0) == 1:
+                claimed_ids.append(int(row_id))
+                if len(claimed_ids) >= limit:
+                    break
+        if not claimed_ids:
+            return []
+        rows = db.session.query(Article).filter(Article.id.in_(claimed_ids)).all()
+        db.session.commit()
+        return rows
 
 
 def pick_checked_articles_for_refresh(batch_size: int, max_hours: float) -> List[Article]:
@@ -241,7 +316,7 @@ def reconcile_once(
     request_delay: float,
     headless: bool | None = None,
 ) -> Dict[str, int]:
-    rows = pick_pending_articles(batch_size=batch_size, max_hours=max_hours)
+    rows = claim_pending_articles_for_refresh(batch_size=batch_size, max_hours=max_hours)
     if not rows:
         return {"picked": 0, "checked": 0, "failed": 0, "authors_updated": 0}
 
