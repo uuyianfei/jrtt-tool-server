@@ -27,6 +27,7 @@ from app.models import Article, AuthorSource
 from app.time_utils import cn_now_naive
 
 INFO_API_URL = "https://m.toutiao.com/i{gid}/info/"
+CHECKED_REFRESH_CLAIM_ERROR = "checked-refreshing"
 
 
 def fetch_info_api(gid: str, timeout: int = 15) -> Dict:
@@ -55,7 +56,8 @@ def pick_pending_articles(batch_size: int, max_hours: float) -> List[Article]:
             Article.metrics_status != "checked",
             Article.published_at >= cutoff,
         )
-        .order_by(Article.id.asc())
+        # 优先最新文章先校准
+        .order_by(Article.published_at.desc(), Article.id.desc())
         .limit(max(1, int(batch_size)))
         .all()
     )
@@ -67,9 +69,12 @@ def pick_checked_articles_for_refresh(batch_size: int, max_hours: float) -> List
     return (
         Article.query.filter(
             Article.metrics_status == "checked",
+            Article.metrics_error != CHECKED_REFRESH_CLAIM_ERROR,
             Article.published_at >= cutoff,
         )
         .order_by(
+            # 优先“最新发布的文章”；同一发布时间里，优先最久未更新（或从未更新）
+            Article.published_at.desc(),
             Article.metrics_checked_at.is_(None).desc(),
             Article.metrics_checked_at.asc(),
             Article.id.asc(),
@@ -79,12 +84,92 @@ def pick_checked_articles_for_refresh(batch_size: int, max_hours: float) -> List
     )
 
 
+def claim_checked_articles_for_refresh(batch_size: int, max_hours: float) -> List[Article]:
+    """
+    Strict non-duplicate across multiple workers:
+    - Atomically claim rows before doing HTTP calls.
+    - Claim uses `metrics_error` sentinel and `SELECT ... FOR UPDATE SKIP LOCKED`.
+    """
+    now = cn_now_naive()
+    cutoff = now - timedelta(hours=max(0.0, float(max_hours)))
+    limit = max(1, int(batch_size))
+
+    base_q = (
+        db.session.query(Article.id)
+        .filter(
+            Article.metrics_status == "checked",
+            Article.metrics_error != CHECKED_REFRESH_CLAIM_ERROR,
+            Article.published_at >= cutoff,
+        )
+        .order_by(
+            Article.published_at.desc(),
+            Article.metrics_checked_at.is_(None).desc(),
+            Article.metrics_checked_at.asc(),
+            Article.id.asc(),
+        )
+    )
+
+    # Preferred path: SELECT ... FOR UPDATE SKIP LOCKED
+    try:
+        q = (
+            db.session.query(Article)
+            .filter(
+                Article.metrics_status == "checked",
+                Article.metrics_error != CHECKED_REFRESH_CLAIM_ERROR,
+                Article.published_at >= cutoff,
+            )
+            .order_by(
+                Article.published_at.desc(),
+                Article.metrics_checked_at.is_(None).desc(),
+                Article.metrics_checked_at.asc(),
+                Article.id.asc(),
+            )
+            .with_for_update(skip_locked=True)
+            .limit(limit)
+        )
+
+        rows: List[Article] = q.all()
+        if not rows:
+            return []
+
+        for row in rows:
+            row.metrics_error = CHECKED_REFRESH_CLAIM_ERROR
+
+        db.session.commit()
+        return rows
+    except Exception:
+        # Fallback path: conditional UPDATE to guarantee exclusivity even without SKIP LOCKED
+        # (May be slower, but keeps strict non-duplicate.)
+        candidate_ids = [row_id for (row_id,) in base_q.limit(limit * 5).all()]
+        if not candidate_ids:
+            return []
+
+        claimed_ids: List[int] = []
+        for row_id in candidate_ids:
+            updated = (
+                db.session.query(Article)
+                .filter(Article.id == row_id, Article.metrics_error != CHECKED_REFRESH_CLAIM_ERROR)
+                .update({"metrics_error": CHECKED_REFRESH_CLAIM_ERROR}, synchronize_session=False)
+            )
+            if int(updated or 0) == 1:
+                claimed_ids.append(int(row_id))
+                if len(claimed_ids) >= limit:
+                    break
+
+        if not claimed_ids:
+            return []
+
+        rows = db.session.query(Article).filter(Article.id.in_(claimed_ids)).all()
+        db.session.commit()
+        return rows
+
+
 def reconcile_checked_once(
     batch_size: int,
     max_hours: float,
     request_delay: float,
 ) -> Dict[str, int]:
-    rows = pick_checked_articles_for_refresh(batch_size=batch_size, max_hours=max_hours)
+    rows = claim_checked_articles_for_refresh(batch_size=batch_size, max_hours=max_hours)
     if not rows:
         return {"picked": 0, "checked_refreshed": 0, "failed": 0}
 
@@ -96,11 +181,17 @@ def reconcile_checked_once(
             gid = str(row.article_id or "").strip()
             if not gid:
                 failed += 1
+                # release claim for retry
+                row.metrics_error = ""
+                row.metrics_status = "checked"
                 continue
             try:
                 info = fetch_info_api(gid)
                 if not info:
                     failed += 1
+                    # release claim for retry
+                    row.metrics_error = ""
+                    row.metrics_status = "checked"
                     continue
 
                 row.view_count = int(info.get("impression_count") or row.view_count or 0)
@@ -118,6 +209,9 @@ def reconcile_checked_once(
                 checked_refreshed += 1
             except Exception:
                 failed += 1
+                # release claim for retry
+                row.metrics_error = ""
+                row.metrics_status = "checked"
             finally:
                 time.sleep(max(0.0, float(request_delay)))
 
