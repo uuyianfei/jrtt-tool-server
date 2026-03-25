@@ -176,22 +176,26 @@ def reconcile_checked_once(
     now = cn_now_naive()
     checked_refreshed = 0
     failed = 0
+    failed_reasons: Dict[str, int] = {}
     try:
         for row in rows:
             gid = str(row.article_id or "").strip()
             if not gid:
                 failed += 1
-                # release claim for retry
-                row.metrics_error = ""
-                row.metrics_status = "checked"
+                row.metrics_status = "failed"
+                row.metrics_error = "missing article_id"
+                row.metrics_checked_at = now
+                failed_reasons["missing_article_id"] = int(failed_reasons.get("missing_article_id", 0)) + 1
                 continue
             try:
                 info = fetch_info_api(gid)
                 if not info:
                     failed += 1
-                    # release claim for retry
-                    row.metrics_error = ""
+                    # Backoff: keep status 可重试，但避免 metrics_checked_at 仍为 NULL 导致下一轮永远最优先
                     row.metrics_status = "checked"
+                    row.metrics_error = "info api empty"
+                    row.metrics_checked_at = now
+                    failed_reasons["info_api_empty"] = int(failed_reasons.get("info_api_empty", 0)) + 1
                     continue
 
                 row.view_count = int(info.get("impression_count") or row.view_count or 0)
@@ -207,11 +211,15 @@ def reconcile_checked_once(
                 row.metrics_checked_at = now
                 row.metrics_error = ""
                 checked_refreshed += 1
-            except Exception:
+            except Exception as exc:
                 failed += 1
-                # release claim for retry
-                row.metrics_error = ""
+                # Backoff: 写入失败原因，避免该行在排序里持续被命中
                 row.metrics_status = "checked"
+                reason = exc.__class__.__name__ or "Exception"
+                failed_reasons[reason] = int(failed_reasons.get(reason, 0)) + 1
+                err_msg = " ".join(str(exc).split())[:300]
+                row.metrics_error = f"checked-refresh exception: {reason}: {err_msg}"[:500]
+                row.metrics_checked_at = now
             finally:
                 time.sleep(max(0.0, float(request_delay)))
 
@@ -220,6 +228,7 @@ def reconcile_checked_once(
             "picked": len(rows),
             "checked_refreshed": checked_refreshed,
             "failed": failed,
+            "failed_reasons": failed_reasons,
         }
     except Exception:
         db.session.rollback()
@@ -429,10 +438,11 @@ def main() -> int:
                     request_delay=float(args.request_delay),
                 )
                 app.logger.info(
-                    "reconcile checked-refresh done picked=%s checked_refreshed=%s failed=%s",
+                    "reconcile checked-refresh done picked=%s checked_refreshed=%s failed=%s failed_reasons=%s",
                     stats["picked"],
                     stats["checked_refreshed"],
                     stats["failed"],
+                    stats.get("failed_reasons", {}),
                 )
             else:
                 stats = reconcile_once(
