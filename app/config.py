@@ -103,3 +103,10 @@ class Config:
     # at most one worker at a time (claim can be re-acquired after expiry).
     FAST_CRAWL_CLAIM_ENABLED = os.getenv("FAST_CRAWL_CLAIM_ENABLED", "true").lower() == "true"
     FAST_CRAWL_CLAIM_LEASE_SECONDS = int(os.getenv("FAST_CRAWL_CLAIM_LEASE_SECONDS", "300"))
+
+    # --- db.create_all distributed mutex (avoid MySQL 1684 concurrent DDL) ---
+    DB_CREATE_ALL_LOCK_ENABLED = os.getenv("DB_CREATE_ALL_LOCK_ENABLED", "true").lower() == "true"
+    DB_CREATE_ALL_LOCK_NAME = os.getenv("DB_CREATE_ALL_LOCK_NAME", "jrtt_db_create_all")
+    DB_CREATE_ALL_LOCK_TIMEOUT_SECONDS = int(os.getenv("DB_CREATE_ALL_LOCK_TIMEOUT_SECONDS", "20"))
+    DB_CREATE_ALL_LOCK_MAX_TRIES = int(os.getenv("DB_CREATE_ALL_LOCK_MAX_TRIES", "6"))
+    DB_CREATE_ALL_LOCK_SLEEP_SECONDS = float(os.getenv("DB_CREATE_ALL_LOCK_SLEEP_SECONDS", "2.0"))

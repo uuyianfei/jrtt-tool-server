@@ -178,11 +178,12 @@ class FastCrawler:
 
         sql = text(
             """
-            INSERT INTO fast_crawl_claims (gid, owner, expires_at)
-            VALUES (:gid, :owner, :expires_at)
+            INSERT INTO fast_crawl_claims (gid, owner, expires_at, created_at, updated_at)
+            VALUES (:gid, :owner, :expires_at, :created_at, :updated_at)
             ON DUPLICATE KEY UPDATE
               owner = IF(expires_at < NOW(), VALUES(owner), owner),
-              expires_at = IF(expires_at < NOW(), VALUES(expires_at), expires_at)
+              expires_at = IF(expires_at < NOW(), VALUES(expires_at), expires_at),
+              updated_at = IF(expires_at < NOW(), VALUES(updated_at), updated_at)
             """
         )
 
@@ -196,6 +197,8 @@ class FastCrawler:
                             "gid": str(gid).strip(),
                             "owner": owner,
                             "expires_at": expires_at,
+                            "created_at": now,
+                            "updated_at": now,
                         },
                     )
                 db.session.commit()
