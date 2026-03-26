@@ -97,6 +97,11 @@ class Config:
     METRICS_RECONCILE_MAX_HOURS = float(os.getenv("METRICS_RECONCILE_MAX_HOURS", "24"))
     METRICS_RECONCILE_REQUEST_DELAY = float(os.getenv("METRICS_RECONCILE_REQUEST_DELAY", "0.25"))
 
+    # --- Reconcile pending "author followers" distributed claim ---
+    # Prevent multiple reconcile workers from updating the same `author_sources` row concurrently.
+    AUTHOR_FANS_CLAIM_ENABLED = os.getenv("AUTHOR_FANS_CLAIM_ENABLED", "true").lower() == "true"
+    AUTHOR_FANS_CLAIM_LEASE_SECONDS = int(os.getenv("AUTHOR_FANS_CLAIM_LEASE_SECONDS", "240"))
+
     # --- Fast HTTP crawler distributed claim (no-miss mode) ---
     # When enabled, `fast_crawler` will ignore FAST_CRAWL_SHARD_COUNT/INDEX hard filtering
     # and instead use `fast_crawl_claims` lease rows to ensure each gid is processed by

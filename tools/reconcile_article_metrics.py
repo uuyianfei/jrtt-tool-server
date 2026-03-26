@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import socket
 import sys
 import time
 from datetime import timedelta
@@ -19,16 +20,92 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import requests
 from flask import current_app
+from sqlalchemy import text as sql_text
 
 from app import create_app
 from app.crawler import ToutiaoCrawler
 from app.extensions import db
-from app.models import Article, AuthorSource
+from app.models import Article, AuthorFansClaim, AuthorSource
 from app.time_utils import cn_now_naive
 
 INFO_API_URL = "https://m.toutiao.com/i{gid}/info/"
 CHECKED_REFRESH_CLAIM_ERROR = "checked-refreshing"
 PENDING_REFRESH_CLAIM_ERROR = "pending-refreshing"
+
+
+def _reconcile_author_fans_claim_owner() -> str:
+    role = str(current_app.config.get("WORKER_ROLE") or "").strip()
+    if role:
+        return role
+    hostname = socket.gethostname()
+    pid = os.getpid()
+    return f"reconcile-author-fans-{hostname}-{pid}"
+
+
+def claim_author_ids(author_ids: List[int]) -> List[int]:
+    """
+    Distributed lease claim for reconcile pending "author followers" update.
+
+    Return: only author_ids successfully claimed by this worker (still valid lease).
+    """
+
+    # Always keep behavior safe by default: when disabled, treat all as claimed.
+    if not bool(current_app.config.get("AUTHOR_FANS_CLAIM_ENABLED", True)):
+        return sorted({int(a) for a in author_ids if a is not None})
+
+    uniq_author_ids = sorted({int(a) for a in author_ids if a is not None})
+    if not uniq_author_ids:
+        return []
+
+    lease_seconds = int(current_app.config.get("AUTHOR_FANS_CLAIM_LEASE_SECONDS", 240))
+    owner = _reconcile_author_fans_claim_owner()
+    now = cn_now_naive()
+    expires_at = now + timedelta(seconds=max(1, int(lease_seconds)))
+
+    # Keep each MySQL transaction small to reduce lock duration.
+    claim_batch_size = 200
+    sql = sql_text(
+        """
+        INSERT INTO author_fans_claims (author_id, owner, expires_at, created_at, updated_at)
+        VALUES (:author_id, :owner, :expires_at, :created_at, :updated_at)
+        ON DUPLICATE KEY UPDATE
+          owner = IF(expires_at < NOW(), VALUES(owner), owner),
+          expires_at = IF(expires_at < NOW(), VALUES(expires_at), expires_at),
+          updated_at = IF(expires_at < NOW(), VALUES(updated_at), updated_at)
+        """
+    )
+
+    for i in range(0, len(uniq_author_ids), claim_batch_size):
+        batch = uniq_author_ids[i : i + claim_batch_size]
+        try:
+            for author_id in batch:
+                db.session.execute(
+                    sql,
+                    {
+                        "author_id": int(author_id),
+                        "owner": owner,
+                        "expires_at": expires_at,
+                        "created_at": now,
+                        "updated_at": now,
+                    },
+                )
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
+            # Best-effort: keep processing other batches.
+            # (The final "claimed" filtering below will ensure we only touch valid leases.)
+            continue
+
+    claimed_rows = (
+        db.session.query(AuthorFansClaim.author_id)
+        .filter(
+            AuthorFansClaim.author_id.in_(uniq_author_ids),
+            AuthorFansClaim.owner == owner,
+            AuthorFansClaim.expires_at > now,
+        )
+        .all()
+    )
+    return [int(r[0]) for r in claimed_rows]
 
 
 def fetch_info_api(gid: str, timeout: int = 15) -> Dict:
@@ -391,32 +468,71 @@ def reconcile_once(
                 row.author_id = author.id
                 authors_mapped += 1
 
-        # 1) Update author followers in batch (dedup by author_id)
-        author_ids = sorted({int(r.author_id) for r in rows if r.author_id})
-        for author_id in author_ids:
-            author = AuthorSource.query.filter(AuthorSource.id == author_id).first()
-            if not author or not author.author_url:
-                continue
-            # 延迟启动浏览器：只有确实要抓作者粉丝时才创建 Selenium driver
-            if crawler is None:
-                crawler = ToutiaoCrawler(headless=headless)
-            fans = int(crawler._get_author_fans_count(author.author_url) or 0)  # noqa: SLF001
-            if fans > 0:
-                author.followers = fans
-                author.last_seen_at = now
-                author.last_error = ""
-                authors_updated += 1
-            else:
-                # 抓不到粉丝时，不要让文章立刻进入“失败终态”，
-                # 只记录失败原因以便后续重试/排查。
-                author.fail_count = int(author.fail_count or 0) + 1
-                author.last_error = "get fans returned 0"
-            author.last_crawled_at = now
-            time.sleep(max(0.0, float(request_delay)))
+        # Step 0) Snapshot minimal per-article fields so step boundaries don't
+        # trigger SQLAlchemy attribute reloads while we are doing HTTP calls.
+        article_meta_by_id: Dict[int, Dict] = {}
+        for r in rows:
+            article_meta_by_id[int(r.id)] = {
+                "gid": str(r.article_id or "").strip(),
+                "author_id": (int(r.author_id) if r.author_id else None),
+                "prev_view": int(r.view_count or 0),
+                "prev_like": int(r.like_count or 0),
+                "prev_comment": int(r.comment_count or 0),
+            }
+
+        # Step 0.2) Commit immediately after author mapping to release locks early.
+        if need_map_rows:
+            db.session.commit()
+
+        # Step 1) Update author followers in batch, only for successfully claimed authors.
+        author_ids = sorted(
+            {m["author_id"] for m in article_meta_by_id.values() if m.get("author_id") is not None}
+        )
+        claimed_author_ids = claim_author_ids(author_ids)
+        claimed_author_ids_set = set(claimed_author_ids)
+
+        authors_map: Dict[int, AuthorSource] = {}
+        author_followers_map: Dict[int, int] = {}
+        if claimed_author_ids:
+            authors = AuthorSource.query.filter(AuthorSource.id.in_(claimed_author_ids)).all()
+            authors_map = {a.id: a for a in authors}
+
+            for author_id in claimed_author_ids:
+                author = authors_map.get(author_id)
+                if not author or not author.author_url:
+                    continue
+
+                # 延迟启动浏览器：只有确实要抓作者粉丝时才创建 Selenium driver
+                if crawler is None:
+                    crawler = ToutiaoCrawler(headless=headless)
+
+                fans = int(crawler._get_author_fans_count(author.author_url) or 0)  # noqa: SLF001
+                if fans > 0:
+                    author.followers = fans
+                    author.last_seen_at = now
+                    author.last_error = ""
+                    authors_updated += 1
+                else:
+                    # 抓不到粉丝时，不要让文章立刻进入“失败终态”，
+                    # 只记录失败原因以便后续重试/排查。
+                    author.fail_count = int(author.fail_count or 0) + 1
+                    author.last_error = "get fans returned 0"
+                author.last_crawled_at = now
+                time.sleep(max(0.0, float(request_delay)))
+
+            # Step 1. end: commit before HTTP calls so we don't hold locks longer than needed.
+            db.session.commit()
+            author_followers_map = {aid: int(a.followers or 0) for aid, a in authors_map.items()}
 
         # 2) Refresh per-article metrics and status
         for row in rows:
-            gid = str(row.article_id or "").strip()
+            meta = article_meta_by_id.get(int(row.id)) or {}
+            gid = str(meta.get("gid") or "").strip()
+            author_id = meta.get("author_id")
+            prev_view = int(meta.get("prev_view") or 0)
+            prev_like = int(meta.get("prev_like") or 0)
+            prev_comment = int(meta.get("prev_comment") or 0)
+
             if not gid:
                 row.metrics_status = "failed"
                 row.metrics_error = "missing article_id"
@@ -431,29 +547,33 @@ def reconcile_once(
                     failed += 1
                     continue
 
-                row.view_count = int(info.get("impression_count") or row.view_count or 0)
-                row.like_count = int(info.get("digg_count") or row.like_count or 0)
+                row.view_count = int(info.get("impression_count") or prev_view or 0)
+                row.like_count = int(info.get("digg_count") or prev_like or 0)
                 row.comment_count = int(
                     max(
                         int(info.get("comment_count") or 0),
-                        int(row.comment_count or 0),
+                        int(prev_comment or 0),
                     )
                 )
 
-                author_ok = False
-                if row.author_id:
-                    author = AuthorSource.query.filter(AuthorSource.id == row.author_id).first()
-                    author_ok = bool(author and int(author.followers or 0) > 0)
+                author_ok = (
+                    author_id is not None
+                    and int(author_id) in claimed_author_ids_set
+                    and int(author_followers_map.get(int(author_id)) or 0) > 0
+                )
                 if author_ok:
                     row.metrics_status = "checked"
                     row.metrics_checked_at = now
                     row.metrics_error = ""
                     checked += 1
                 else:
-                    # 作者粉丝获取失败时：保持可重试状态 pending，而不是把整批文章直接打成 failed。
+                    # 作者粉丝获取失败（或本轮没拿到 claim）：保持可重试状态 pending。
                     row.metrics_status = "pending"
                     row.metrics_checked_at = None
-                    row.metrics_error = "author followers unavailable"
+                    if author_id is not None and int(author_id) not in claimed_author_ids_set:
+                        row.metrics_error = "author followers not claimed"
+                    else:
+                        row.metrics_error = "author followers unavailable"
                     pending_author_followers_unavailable += 1
             except Exception as exc:
                 row.metrics_status = "failed"

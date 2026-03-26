@@ -68,6 +68,30 @@ class FastCrawlClaim(db.Model):
     )
 
 
+class AuthorFansClaim(db.Model):
+    """
+    Distributed claim (lease) for reconcile pending "author followers" refresh.
+
+    Goal: avoid multiple concurrent workers updating the same `author_sources.id`
+    and causing MySQL lock wait timeout (1205).
+    """
+
+    __tablename__ = "author_fans_claims"
+
+    id = db.Column(db.Integer, primary_key=True)
+    author_id = db.Column(db.Integer, unique=True, nullable=False, index=True)
+    owner = db.Column(db.String(128), nullable=False, index=True)
+    expires_at = db.Column(db.DateTime, nullable=False, index=True)
+
+    created_at = db.Column(db.DateTime, nullable=False, default=cn_now_naive, index=True)
+    updated_at = db.Column(
+        db.DateTime,
+        nullable=False,
+        default=cn_now_naive,
+        onupdate=cn_now_naive,
+    )
+
+
 class RewriteTask(db.Model):
     __tablename__ = "rewrite_tasks"
 
