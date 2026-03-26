@@ -8,8 +8,10 @@ Data flow:
 
 import asyncio
 import logging
+import os
 import random
 import re
+import socket
 import time
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Set
@@ -17,10 +19,11 @@ from typing import Dict, List, Optional, Set
 import httpx
 from bs4 import BeautifulSoup
 from flask import Flask
+from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from .extensions import db
-from .models import Article, AuthorSource
+from .models import Article, AuthorSource, FastCrawlClaim
 from .time_utils import SHANGHAI_TZ, cn_now_naive
 from .utils import sha256_hex
 
@@ -124,11 +127,96 @@ class FastCrawler:
         )
         self.min_content_len: int = int(cfg.get("FAST_CRAWL_MIN_CONTENT_LENGTH", 80))
         self.max_fans: int = int(cfg.get("FAST_CRAWL_MAX_FANS", 0))
+        # gid 强分片：历史方案（可能因跨地域 feed 不对称导致“gid 被双方都跳过”从而漏写）。
+        # 当开启分布式 claim 时，会忽略该强分片逻辑，走“租约抢占”保证尽量不漏。
+        self.shard_count: int = int(os.getenv("FAST_CRAWL_SHARD_COUNT", "1"))
+        self.shard_index: int = int(os.getenv("FAST_CRAWL_SHARD_INDEX", "0"))
         self.block_keywords: List[str] = [
             kw.strip()
             for kw in str(cfg.get("CRAWL_BLOCK_AUTHOR_KEYWORDS", "")).split(",")
             if kw.strip()
         ]
+        # 分布式 claim：按 gid 抢占 lease（MySQL 原子 upsert），尽量不漏且降低重复抓取/锁冲突。
+        self.claim_enabled: bool = bool(cfg.get("FAST_CRAWL_CLAIM_ENABLED", True))
+        self.claim_lease_seconds: int = int(cfg.get("FAST_CRAWL_CLAIM_LEASE_SECONDS", 300))
+        role = str(cfg.get("WORKER_ROLE") or "").strip()
+        hostname = socket.gethostname()
+        pid = os.getpid()
+        self.claim_owner: str = role or f"fast-{hostname}-{pid}"
+
+    def _belongs_to_shard(self, gid: str) -> bool:
+        """
+        Stable sharding using sha256(gid) % shard_count.
+        When shard_count <= 1, everything belongs to this worker.
+        """
+        if self.shard_count <= 1:
+            return True
+        raw = str(gid or "").strip()
+        if not raw:
+            return False
+        shard = int(sha256_hex(raw), 16) % self.shard_count
+        return shard == self.shard_index
+
+    def _claim_gids(self, gids: List[str]) -> List[str]:
+        """
+        MySQL distributed claim (lease) per gid.
+
+        - Each gid maps to at most one owner at a time.
+        - When a gid's lease expires, a different worker can re-claim it.
+        - Must be called inside `self.app.app_context()` (DB usage).
+        """
+        if not self.claim_enabled or not gids:
+            return []
+
+        owner = self.claim_owner
+        now = cn_now_naive()
+        expires_at = now + timedelta(seconds=max(1, int(self.claim_lease_seconds)))
+
+        # Keep each DB transaction small to reduce lock duration.
+        claim_batch_size = 200
+        claimed: List[str] = []
+
+        sql = text(
+            """
+            INSERT INTO fast_crawl_claims (gid, owner, expires_at)
+            VALUES (:gid, :owner, :expires_at)
+            ON DUPLICATE KEY UPDATE
+              owner = IF(expires_at < NOW(), VALUES(owner), owner),
+              expires_at = IF(expires_at < NOW(), VALUES(expires_at), expires_at)
+            """
+        )
+
+        for i in range(0, len(gids), claim_batch_size):
+            batch = gids[i : i + claim_batch_size]
+            try:
+                for gid in batch:
+                    db.session.execute(
+                        sql,
+                        {
+                            "gid": str(gid).strip(),
+                            "owner": owner,
+                            "expires_at": expires_at,
+                        },
+                    )
+                db.session.commit()
+            except Exception:
+                db.session.rollback()
+                logger.exception("fast_crawler claim failed batch_size=%s", len(batch))
+                continue
+
+            # Only keep gids that we successfully inserted/overrode (lease not expired).
+            rows = (
+                db.session.query(FastCrawlClaim.gid)
+                .filter(
+                    FastCrawlClaim.gid.in_(batch),
+                    FastCrawlClaim.owner == owner,
+                    FastCrawlClaim.expires_at > now,
+                )
+                .all()
+            )
+            claimed.extend([r[0] for r in rows])
+
+        return claimed
 
     def _is_blocked_author(self, author: str) -> bool:
         if not author or not self.block_keywords:
@@ -518,15 +606,14 @@ class FastCrawler:
                 stats["errors"] += 1
                 db.session.rollback()
                 logger.warning("upsert failed gid=%s err=%s", gid, exc)
-
-        if affected > 0:
-            try:
-                _commit_with_retry()
-            except Exception as exc:
-                db.session.rollback()
-                stats["errors"] += affected
-                affected = 0
-                logger.exception("batch commit failed: %s", exc)
+            finally:
+                # 每处理一条 feed_item 就尽量提交，避免整轮只最后 commit 导致长事务
+                # 长时间锁住 articles/author_sources，与 metrics-reconcile 并发时易触发 1205。
+                try:
+                    _commit_with_retry()
+                except Exception as commit_exc:
+                    db.session.rollback()
+                    logger.warning("fast_crawler per-item commit failed gid=%s err=%s", gid, commit_exc)
 
         logger.info(
             "upsert summary candidates=%s info_ok=%s created=%s updated=%s "
@@ -564,7 +651,23 @@ class FastCrawler:
                 return 0
 
             group_ids = [str(item.get("group_id", "")) for item in feed_items if item.get("group_id")]
-            logger.info("fast crawl: fetching info for %s articles", len(group_ids))
+            if self.claim_enabled:
+                logger.info(
+                    "fast crawl: claim enabled, skip strong gid sharding shard_index=%s/%s",
+                    self.shard_index,
+                    self.shard_count,
+                )
+            else:
+                # Apply gid sharding before any DB existence checks.
+                if self.shard_count > 1:
+                    group_ids = [gid for gid in group_ids if self._belongs_to_shard(gid)]
+                logger.info(
+                    "fast crawl: sharding shard_index=%s/%s group_ids=%s",
+                    self.shard_index,
+                    self.shard_count,
+                    len(group_ids),
+                )
+            logger.info("fast crawl: fetching info candidates=%s", len(group_ids))
 
             # Filter out already-known articles that were seen recently to save API calls
             with self.app.app_context():
@@ -585,15 +688,37 @@ class FastCrawler:
                 len(new_gids), len(existing_ids), len(group_ids),
             )
 
-            info_map = await self.fetch_infos_batch(client, new_gids)
+            if self.claim_enabled and new_gids:
+                with self.app.app_context():
+                    claimed_gids = self._claim_gids(new_gids)
+            else:
+                claimed_gids = new_gids
+
+            if not claimed_gids:
+                logger.info("fast crawl: no gids claimed (another worker may be processing)")
+                return 0
+
+            gid_set = set(claimed_gids)
+            claimed_feed_items = [it for it in feed_items if str(it.get("group_id", "")) in gid_set]
+
+            logger.info(
+                "fast crawl: claimed_gids=%s from new_gids=%s",
+                len(claimed_gids),
+                len(new_gids),
+            )
+
+            info_map = await self.fetch_infos_batch(client, claimed_gids)
 
         with self.app.app_context():
-            affected = self._filter_and_upsert(feed_items, info_map)
+            affected = self._filter_and_upsert(claimed_feed_items, info_map)
 
         elapsed = time.perf_counter() - started
         logger.info(
             "fast crawl done: upserted=%s elapsed=%.1fs feed_items=%s info_fetched=%s",
-            affected, elapsed, len(feed_items), len(info_map),
+            affected,
+            elapsed,
+            len(claimed_feed_items),
+            len(info_map),
         )
         return affected
 

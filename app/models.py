@@ -44,6 +44,30 @@ class Article(db.Model):
     author_ref = relationship("AuthorSource", foreign_keys=[author_id])
 
 
+class FastCrawlClaim(db.Model):
+    """
+    Distributed claim (lease) for fast-crawler gid processing.
+
+    Goal: avoid cross-region feed asymmetry causing "gid is seen but never processed"
+    when multiple workers run concurrently.
+    """
+
+    __tablename__ = "fast_crawl_claims"
+
+    id = db.Column(db.Integer, primary_key=True)
+    gid = db.Column(db.String(64), unique=True, nullable=False, index=True)
+    owner = db.Column(db.String(128), nullable=False, index=True)
+    expires_at = db.Column(db.DateTime, nullable=False, index=True)
+
+    created_at = db.Column(db.DateTime, nullable=False, default=cn_now_naive, index=True)
+    updated_at = db.Column(
+        db.DateTime,
+        nullable=False,
+        default=cn_now_naive,
+        onupdate=cn_now_naive,
+    )
+
+
 class RewriteTask(db.Model):
     __tablename__ = "rewrite_tasks"
 

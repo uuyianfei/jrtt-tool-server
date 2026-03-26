@@ -96,3 +96,10 @@ class Config:
     METRICS_RECONCILE_BATCH_SIZE = int(os.getenv("METRICS_RECONCILE_BATCH_SIZE", "30"))
     METRICS_RECONCILE_MAX_HOURS = float(os.getenv("METRICS_RECONCILE_MAX_HOURS", "24"))
     METRICS_RECONCILE_REQUEST_DELAY = float(os.getenv("METRICS_RECONCILE_REQUEST_DELAY", "0.25"))
+
+    # --- Fast HTTP crawler distributed claim (no-miss mode) ---
+    # When enabled, `fast_crawler` will ignore FAST_CRAWL_SHARD_COUNT/INDEX hard filtering
+    # and instead use `fast_crawl_claims` lease rows to ensure each gid is processed by
+    # at most one worker at a time (claim can be re-acquired after expiry).
+    FAST_CRAWL_CLAIM_ENABLED = os.getenv("FAST_CRAWL_CLAIM_ENABLED", "true").lower() == "true"
+    FAST_CRAWL_CLAIM_LEASE_SECONDS = int(os.getenv("FAST_CRAWL_CLAIM_LEASE_SECONDS", "300"))

@@ -492,6 +492,18 @@ def main() -> int:
     parser.add_argument("--request-delay", type=float, default=0.25)
     parser.add_argument("--loop", action="store_true", default=False)
     parser.add_argument("--interval-seconds", type=int, default=60)
+    parser.add_argument(
+        "--empty-threshold",
+        type=int,
+        default=2,
+        help="连续轮空次数达到阈值后退避",
+    )
+    parser.add_argument(
+        "--empty-backoff-seconds",
+        type=int,
+        default=600,
+        help="连续轮空退避时长（秒）",
+    )
     args = parser.parse_args()
 
     app = create_app(enable_scheduler=False)
@@ -505,6 +517,7 @@ def main() -> int:
             float(args.max_hours),
             bool(headless),
         )
+        empty_rounds = 0
         while True:
             if str(args.mode) == "checked-refresh":
                 stats = reconcile_checked_once(
@@ -519,6 +532,11 @@ def main() -> int:
                     stats["failed"],
                     stats.get("failed_reasons", {}),
                 )
+                # 连续轮空：本轮没有真正刷新任何条
+                if int(stats.get("checked_refreshed", 0)) <= 0:
+                    empty_rounds += 1
+                else:
+                    empty_rounds = 0
             else:
                 stats = reconcile_once(
                     batch_size=int(args.batch_size),
@@ -535,8 +553,21 @@ def main() -> int:
                     stats.get("pending_author_followers_unavailable", 0),
                     stats.get("authors_mapped", 0),
                 )
+                # 连续轮空：本轮没有挑到任何 pending
+                if int(stats.get("picked", 0)) <= 0:
+                    empty_rounds += 1
+                else:
+                    empty_rounds = 0
             if not args.loop:
                 break
+            if empty_rounds >= int(args.empty_threshold):
+                app.logger.info(
+                    "reconcile empty rounds threshold reached (empty_rounds=%s), backoff %s seconds",
+                    empty_rounds,
+                    int(args.empty_backoff_seconds),
+                )
+                time.sleep(int(args.empty_backoff_seconds))
+                empty_rounds = 0
             time.sleep(max(5, int(args.interval_seconds)))
     return 0
 
