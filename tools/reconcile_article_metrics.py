@@ -21,6 +21,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import requests
 from flask import current_app
 from sqlalchemy import text as sql_text
+from sqlalchemy.exc import OperationalError
 
 from app import create_app
 from app.crawler import ToutiaoCrawler
@@ -31,6 +32,28 @@ from app.time_utils import cn_now_naive
 INFO_API_URL = "https://m.toutiao.com/i{gid}/info/"
 CHECKED_REFRESH_CLAIM_ERROR = "checked-refreshing"
 PENDING_REFRESH_CLAIM_ERROR = "pending-refreshing"
+
+
+def _is_mysql_retryable_lock_error(exc: Exception) -> bool:
+    if not isinstance(exc, OperationalError):
+        return False
+    orig = getattr(exc, "orig", None)
+    args = getattr(orig, "args", None)
+    errno = args[0] if args else None
+    return int(errno or 0) in (1205, 1213)
+
+
+def _commit_with_retry(*, retries: int = 3, retry_sleep_seconds: float = 0.2) -> None:
+    for attempt in range(max(1, int(retries))):
+        try:
+            db.session.commit()
+            return
+        except Exception as exc:
+            db.session.rollback()
+            if _is_mysql_retryable_lock_error(exc) and attempt < int(retries) - 1:
+                time.sleep(max(0.0, float(retry_sleep_seconds)) * (attempt + 1))
+                continue
+            raise
 
 
 def _reconcile_author_fans_claim_owner() -> str:
@@ -182,7 +205,7 @@ def claim_pending_articles_for_refresh(
             return []
         for row in rows:
             row.metrics_error = PENDING_REFRESH_CLAIM_ERROR
-        db.session.commit()
+        _commit_with_retry()
         return rows
     except Exception:
         # Fallback: conditional UPDATE to ensure exclusivity
@@ -211,7 +234,7 @@ def claim_pending_articles_for_refresh(
         if not claimed_ids:
             return []
         rows = db.session.query(Article).filter(Article.id.in_(claimed_ids)).all()
-        db.session.commit()
+        _commit_with_retry()
         return rows
 
 
@@ -287,7 +310,7 @@ def claim_checked_articles_for_refresh(batch_size: int, max_hours: float) -> Lis
         for row in rows:
             row.metrics_error = CHECKED_REFRESH_CLAIM_ERROR
 
-        db.session.commit()
+        _commit_with_retry()
         return rows
     except Exception:
         # Fallback path: conditional UPDATE to guarantee exclusivity even without SKIP LOCKED
@@ -312,7 +335,7 @@ def claim_checked_articles_for_refresh(batch_size: int, max_hours: float) -> Lis
             return []
 
         rows = db.session.query(Article).filter(Article.id.in_(claimed_ids)).all()
-        db.session.commit()
+        _commit_with_retry()
         return rows
 
 
@@ -375,7 +398,7 @@ def reconcile_checked_once(
             finally:
                 time.sleep(max(0.0, float(request_delay)))
 
-        db.session.commit()
+        _commit_with_retry()
         return {
             "picked": len(rows),
             "checked_refreshed": checked_refreshed,
@@ -439,7 +462,8 @@ def reconcile_once(
             # 0.2) Create/find AuthorSource, then assign author_id back to Article.
             author_urls = sorted({(r.author_url or "").strip() for r in need_map_rows if (r.author_url or "").strip()})
             if author_urls:
-                existing = AuthorSource.query.filter(AuthorSource.author_url.in_(author_urls)).all()
+                with db.session.no_autoflush:
+                    existing = AuthorSource.query.filter(AuthorSource.author_url.in_(author_urls)).all()
                 existing_map = {a.author_url: a for a in existing}
             else:
                 existing_map = {}
@@ -482,7 +506,7 @@ def reconcile_once(
 
         # Step 0.2) Commit immediately after author mapping to release locks early.
         if need_map_rows:
-            db.session.commit()
+            _commit_with_retry()
 
         # Step 1) Update author followers in batch, only for successfully claimed authors.
         author_ids = sorted(
@@ -521,7 +545,7 @@ def reconcile_once(
                 time.sleep(max(0.0, float(request_delay)))
 
             # Step 1. end: commit before HTTP calls so we don't hold locks longer than needed.
-            db.session.commit()
+            _commit_with_retry()
             author_followers_map = {aid: int(a.followers or 0) for aid, a in authors_map.items()}
 
         # 2) Refresh per-article metrics and status
@@ -582,7 +606,7 @@ def reconcile_once(
             finally:
                 time.sleep(max(0.0, float(request_delay)))
 
-        db.session.commit()
+        _commit_with_retry()
         return {
             "picked": len(rows),
             "checked": checked,
