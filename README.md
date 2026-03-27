@@ -23,6 +23,7 @@ pip install -r requirements.txt
 - `CRAWL_MAX_FANS`：粉丝量阈值（默认 10000）
 - `CRAWL_INTERVAL_SECONDS`：爬虫执行间隔秒数
 - `CLEANUP_INTERVAL_MINUTES`：清理任务执行间隔分钟数
+- `CLAIM_CLEANUP_RETENTION_HOURS`：claim 表保留小时数（默认 24，超期会被清理）
 
 ## 3. 启动
 

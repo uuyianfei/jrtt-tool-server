@@ -23,7 +23,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from webdriver_manager.chrome import ChromeDriverManager
 
 from .extensions import db
-from .models import Article, AuthorSource
+from .models import Article, AuthorFansClaim, AuthorSource, FastCrawlClaim
 from .time_utils import SHANGHAI_TZ, cn_now_naive
 from .utils import parse_hours_ago, parse_number, parse_publish_datetime, sha256_hex
 
@@ -1846,12 +1846,31 @@ def run_author_articles_loop():
 
 def cleanup_expired_articles():
     expire_before = cn_now_naive() - timedelta(hours=24)
-    deleted = (
+    deleted_articles = (
         Article.query.filter(
             ((Article.published_at.isnot(None)) & (Article.published_at < expire_before))
             | ((Article.published_at.is_(None)) & (Article.created_at < expire_before))
         )
         .delete(synchronize_session=False)
     )
+    claim_retention_hours = int(current_app.config.get("CLAIM_CLEANUP_RETENTION_HOURS", 24))
+    claim_expire_before = cn_now_naive() - timedelta(hours=max(1, claim_retention_hours))
+    deleted_fast_claims = (
+        FastCrawlClaim.query.filter(FastCrawlClaim.expires_at < claim_expire_before).delete(
+            synchronize_session=False
+        )
+    )
+    deleted_author_claims = (
+        AuthorFansClaim.query.filter(AuthorFansClaim.expires_at < claim_expire_before).delete(
+            synchronize_session=False
+        )
+    )
     db.session.commit()
-    logger.info("cleanup job finished, deleted=%s", deleted)
+    logger.info(
+        "cleanup job finished, deleted_articles=%s deleted_fast_crawl_claims=%s "
+        "deleted_author_fans_claims=%s claim_retention_hours=%s",
+        deleted_articles,
+        deleted_fast_claims,
+        deleted_author_claims,
+        claim_retention_hours,
+    )

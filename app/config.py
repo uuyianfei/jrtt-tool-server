@@ -26,6 +26,7 @@ class Config:
     CRAWL_INTERVAL_SECONDS = int(os.getenv("CRAWL_INTERVAL_SECONDS", "120"))
     CRAWL_DIRECT_RECOMMEND_ENABLED = os.getenv("CRAWL_DIRECT_RECOMMEND_ENABLED", "false").lower() == "true"
     CLEANUP_INTERVAL_MINUTES = int(os.getenv("CLEANUP_INTERVAL_MINUTES", "30"))
+    CLAIM_CLEANUP_RETENTION_HOURS = int(os.getenv("CLAIM_CLEANUP_RETENTION_HOURS", "24"))
     CRAWL_JOB_ENABLED = os.getenv("CRAWL_JOB_ENABLED", "true").lower() == "true"
     CLEANUP_JOB_ENABLED = os.getenv("CLEANUP_JOB_ENABLED", "true").lower() == "true"
     AUTHOR_COLLECT_JOB_ENABLED = os.getenv("AUTHOR_COLLECT_JOB_ENABLED", "true").lower() == "true"

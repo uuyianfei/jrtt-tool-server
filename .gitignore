@@ -5,3 +5,4 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+/node-jrtt-server/node_modules
