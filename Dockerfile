@@ -10,6 +10,18 @@ WORKDIR /app
 ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
 ENV PIP_DEFAULT_TIMEOUT=300
 
+# APT: default mirror speeds apt-get in regions where deb.debian.org is slow. Official: deb.debian.org
+ARG APT_DEBIAN_MIRROR=mirrors.tuna.tsinghua.edu.cn
+RUN if [ -n "$APT_DEBIAN_MIRROR" ]; then \
+      if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
+        sed -i "s@deb.debian.org@${APT_DEBIAN_MIRROR}@g; s@security.debian.org@${APT_DEBIAN_MIRROR}@g" \
+          /etc/apt/sources.list.d/debian.sources; \
+      elif [ -f /etc/apt/sources.list ]; then \
+        sed -i "s@deb.debian.org@${APT_DEBIAN_MIRROR}@g; s@security.debian.org@${APT_DEBIAN_MIRROR}@g" \
+          /etc/apt/sources.list; \
+      fi; \
+    fi
+
 # Selenium runtime dependencies for Linux container
 RUN apt-get update && apt-get install -y --no-install-recommends \
     chromium \
