@@ -23,7 +23,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from webdriver_manager.chrome import ChromeDriverManager
 
 from .extensions import db
-from .models import Article, AuthorFansClaim, AuthorSource, FastCrawlClaim
+from .models import Article, ArticleWriteClaim, AuthorFansClaim, AuthorSource, FastCrawlClaim
 from .time_utils import SHANGHAI_TZ, cn_now_naive
 from .utils import parse_hours_ago, parse_number, parse_publish_datetime, sha256_hex
 
@@ -1865,12 +1865,18 @@ def cleanup_expired_articles():
             synchronize_session=False
         )
     )
+    deleted_article_write_claims = (
+        ArticleWriteClaim.query.filter(ArticleWriteClaim.expires_at < claim_expire_before).delete(
+            synchronize_session=False
+        )
+    )
     db.session.commit()
     logger.info(
         "cleanup job finished, deleted_articles=%s deleted_fast_crawl_claims=%s "
-        "deleted_author_fans_claims=%s claim_retention_hours=%s",
+        "deleted_author_fans_claims=%s deleted_article_write_claims=%s claim_retention_hours=%s",
         deleted_articles,
         deleted_fast_claims,
         deleted_author_claims,
+        deleted_article_write_claims,
         claim_retention_hours,
     )

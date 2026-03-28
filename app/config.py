@@ -110,6 +110,10 @@ class Config:
     FAST_CRAWL_CLAIM_ENABLED = os.getenv("FAST_CRAWL_CLAIM_ENABLED", "true").lower() == "true"
     FAST_CRAWL_CLAIM_LEASE_SECONDS = int(os.getenv("FAST_CRAWL_CLAIM_LEASE_SECONDS", "900"))
 
+    # --- Per-articles.id write lease (fast-crawler vs metrics-reconcile UPDATE 协调) ---
+    ARTICLE_WRITE_CLAIM_ENABLED = os.getenv("ARTICLE_WRITE_CLAIM_ENABLED", "true").lower() == "true"
+    ARTICLE_WRITE_CLAIM_LEASE_SECONDS = int(os.getenv("ARTICLE_WRITE_CLAIM_LEASE_SECONDS", "900"))
+
     # --- db.create_all distributed mutex (avoid MySQL 1684 concurrent DDL) ---
     DB_CREATE_ALL_LOCK_ENABLED = os.getenv("DB_CREATE_ALL_LOCK_ENABLED", "true").lower() == "true"
     DB_CREATE_ALL_LOCK_NAME = os.getenv("DB_CREATE_ALL_LOCK_NAME", "jrtt_db_create_all")

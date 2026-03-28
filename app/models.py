@@ -44,6 +44,28 @@ class Article(db.Model):
     author_ref = relationship("AuthorSource", foreign_keys=[author_id])
 
 
+class ArticleWriteClaim(db.Model):
+    """
+    Distributed lease on ``articles.id`` so fast-crawler and metrics-reconcile
+    do not concurrently UPDATE the same article row (reduces InnoDB 1205).
+    """
+
+    __tablename__ = "article_write_claims"
+
+    id = db.Column(db.Integer, primary_key=True)
+    articles_row_id = db.Column(db.Integer, unique=True, nullable=False, index=True)
+    owner = db.Column(db.String(128), nullable=False, index=True)
+    expires_at = db.Column(db.DateTime, nullable=False, index=True)
+
+    created_at = db.Column(db.DateTime, nullable=False, default=cn_now_naive, index=True)
+    updated_at = db.Column(
+        db.DateTime,
+        nullable=False,
+        default=cn_now_naive,
+        onupdate=cn_now_naive,
+    )
+
+
 class FastCrawlClaim(db.Model):
     """
     Distributed claim (lease) for fast-crawler gid processing.

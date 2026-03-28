@@ -14,7 +14,7 @@ import socket
 import sys
 import time
 from datetime import timedelta
-from typing import Dict, List
+from typing import Dict, List, Set
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -24,6 +24,7 @@ from sqlalchemy import text as sql_text
 from sqlalchemy.exc import OperationalError
 
 from app import create_app
+from app.article_write_claim import release_article_write, try_acquire_article_write
 from app.crawler import ToutiaoCrawler
 from app.extensions import db
 from app.models import Article, AuthorFansClaim, AuthorSource
@@ -32,6 +33,35 @@ from app.time_utils import cn_now_naive
 INFO_API_URL = "https://m.toutiao.com/i{gid}/info/"
 CHECKED_REFRESH_CLAIM_ERROR = "checked-refreshing"
 PENDING_REFRESH_CLAIM_ERROR = "pending-refreshing"
+
+
+def _article_write_claim_owner() -> str:
+    role = str(current_app.config.get("WORKER_ROLE") or "").strip()
+    if role:
+        return f"{role}-aw"
+    return f"reconcile-aw-{socket.gethostname()}-{os.getpid()}"
+
+
+def _bulk_try_acquire_article_writes(row_ids: List[int], owner: str, lease_seconds: int) -> Set[int]:
+    acquired: Set[int] = set()
+    for rid in row_ids:
+        if try_acquire_article_write(
+            articles_row_id=int(rid),
+            owner=owner,
+            lease_seconds=lease_seconds,
+        ):
+            acquired.add(int(rid))
+    return acquired
+
+
+def _release_article_write_claims(acquired: Set[int], owner: str) -> None:
+    for aid in list(acquired):
+        try:
+            release_article_write(articles_row_id=int(aid), owner=owner)
+        except Exception:
+            current_app.logger.warning(
+                "article_write_claim release failed articles_row_id=%s", aid, exc_info=True
+            )
 
 
 def _is_mysql_retryable_lock_error(exc: Exception) -> bool:
@@ -346,12 +376,46 @@ def reconcile_checked_once(
 ) -> Dict[str, int]:
     rows = claim_checked_articles_for_refresh(batch_size=batch_size, max_hours=max_hours)
     if not rows:
-        return {"picked": 0, "checked_refreshed": 0, "failed": 0}
+        return {
+            "picked": 0,
+            "checked_refreshed": 0,
+            "failed": 0,
+            "skipped_article_write_claim": 0,
+        }
+
+    aw_owner = _article_write_claim_owner()
+    aw_enabled = bool(current_app.config.get("ARTICLE_WRITE_CLAIM_ENABLED", True))
+    aw_lease = int(current_app.config.get("ARTICLE_WRITE_CLAIM_LEASE_SECONDS", 900))
+    write_claim_acquired: Set[int] = set()
+    skipped_article_write_claim = 0
+    if aw_enabled:
+        write_claim_acquired = _bulk_try_acquire_article_writes(
+            [int(r.id) for r in rows],
+            aw_owner,
+            aw_lease,
+        )
+        skipped_article_write_claim = len(rows) - len(write_claim_acquired)
+        picked_before_filter = len(rows)
+        # 未抢到 article 写租约的行：撤掉 checked-refresh 哨兵，避免永久卡在 CHECKED_REFRESH_CLAIM_ERROR
+        for row in rows:
+            if row.id not in write_claim_acquired:
+                row.metrics_error = ""
+        if skipped_article_write_claim:
+            _commit_with_retry()
+        rows = [r for r in rows if r.id in write_claim_acquired]
+        if not rows:
+            return {
+                "picked": picked_before_filter,
+                "checked_refreshed": 0,
+                "failed": 0,
+                "skipped_article_write_claim": skipped_article_write_claim,
+            }
 
     now = cn_now_naive()
     checked_refreshed = 0
     failed = 0
     failed_reasons: Dict[str, int] = {}
+    picked = len(rows)
     try:
         for row in rows:
             gid = str(row.article_id or "").strip()
@@ -400,14 +464,18 @@ def reconcile_checked_once(
 
         _commit_with_retry()
         return {
-            "picked": len(rows),
+            "picked": picked,
             "checked_refreshed": checked_refreshed,
             "failed": failed,
             "failed_reasons": failed_reasons,
+            "skipped_article_write_claim": skipped_article_write_claim,
         }
     except Exception:
         db.session.rollback()
         raise
+    finally:
+        if aw_enabled and write_claim_acquired:
+            _release_article_write_claims(write_claim_acquired, aw_owner)
 
 
 def reconcile_once(
@@ -418,7 +486,13 @@ def reconcile_once(
 ) -> Dict[str, int]:
     rows = claim_pending_articles_for_refresh(batch_size=batch_size, max_hours=max_hours)
     if not rows:
-        return {"picked": 0, "checked": 0, "failed": 0, "authors_updated": 0}
+        return {
+            "picked": 0,
+            "checked": 0,
+            "failed": 0,
+            "authors_updated": 0,
+            "skipped_article_write_claim": 0,
+        }
 
     now = cn_now_naive()
     checked = 0
@@ -426,6 +500,19 @@ def reconcile_once(
     pending_author_followers_unavailable = 0
     authors_updated = 0
     authors_mapped = 0
+    skipped_article_write_claim = 0
+
+    aw_owner = _article_write_claim_owner()
+    aw_enabled = bool(current_app.config.get("ARTICLE_WRITE_CLAIM_ENABLED", True))
+    aw_lease = int(current_app.config.get("ARTICLE_WRITE_CLAIM_LEASE_SECONDS", 900))
+    write_claim_acquired: Set[int] = set()
+    if aw_enabled:
+        write_claim_acquired = _bulk_try_acquire_article_writes(
+            [int(r.id) for r in rows],
+            aw_owner,
+            aw_lease,
+        )
+        skipped_article_write_claim = len(rows) - len(write_claim_acquired)
 
     if headless is None:
         headless = bool(current_app.config.get("CRAWL_HEADLESS", True))
@@ -438,12 +525,16 @@ def reconcile_once(
             # 0.1) Force parse from article page when author_id is missing.
             #     User explicitly requested: do NOT use "news list" author_url; only trust article detail page.
             for row in need_map_rows:
+                if aw_enabled and row.id not in write_claim_acquired:
+                    continue
                 if (row.author_url or "").strip():
                     row.author_url = ""
 
             need_extract_rows = [
                 r for r in need_map_rows if (r.url or "").strip()
             ]
+            if aw_enabled:
+                need_extract_rows = [r for r in need_extract_rows if r.id in write_claim_acquired]
             if need_extract_rows:
                 if crawler is None:
                     crawler = ToutiaoCrawler(headless=headless)
@@ -469,6 +560,8 @@ def reconcile_once(
                 existing_map = {}
 
             for row in need_map_rows:
+                if aw_enabled and row.id not in write_claim_acquired:
+                    continue
                 if row.author_id:
                     continue
                 author_url = (row.author_url or "").strip()
@@ -550,6 +643,8 @@ def reconcile_once(
 
         # 2) Refresh per-article metrics and status
         for row in rows:
+            if aw_enabled and row.id not in write_claim_acquired:
+                continue
             meta = article_meta_by_id.get(int(row.id)) or {}
             gid = str(meta.get("gid") or "").strip()
             author_id = meta.get("author_id")
@@ -614,11 +709,14 @@ def reconcile_once(
             "authors_updated": authors_updated,
             "pending_author_followers_unavailable": pending_author_followers_unavailable,
             "authors_mapped": authors_mapped,
+            "skipped_article_write_claim": skipped_article_write_claim,
         }
     except Exception:
         db.session.rollback()
         raise
     finally:
+        if aw_enabled and write_claim_acquired:
+            _release_article_write_claims(write_claim_acquired, aw_owner)
         if crawler is not None:
             crawler.close()
 
@@ -670,10 +768,12 @@ def main() -> int:
                     request_delay=float(args.request_delay),
                 )
                 app.logger.info(
-                    "reconcile checked-refresh done picked=%s checked_refreshed=%s failed=%s failed_reasons=%s",
+                    "reconcile checked-refresh done picked=%s checked_refreshed=%s failed=%s "
+                    "skipped_article_write_claim=%s failed_reasons=%s",
                     stats["picked"],
                     stats["checked_refreshed"],
                     stats["failed"],
+                    stats.get("skipped_article_write_claim", 0),
                     stats.get("failed_reasons", {}),
                 )
                 # 连续轮空：本轮没有真正刷新任何条
@@ -689,13 +789,15 @@ def main() -> int:
                     headless=headless,
                 )
                 app.logger.info(
-                    "reconcile pending done picked=%s checked=%s failed=%s authors_updated=%s pending_author_followers_unavailable=%s authors_mapped=%s",
+                    "reconcile pending done picked=%s checked=%s failed=%s authors_updated=%s "
+                    "pending_author_followers_unavailable=%s authors_mapped=%s skipped_article_write_claim=%s",
                     stats["picked"],
                     stats["checked"],
                     stats["failed"],
                     stats["authors_updated"],
                     stats.get("pending_author_followers_unavailable", 0),
                     stats.get("authors_mapped", 0),
+                    stats.get("skipped_article_write_claim", 0),
                 )
                 # 连续轮空：本轮没有挑到任何 pending
                 if int(stats.get("picked", 0)) <= 0:

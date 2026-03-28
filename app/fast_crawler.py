@@ -22,6 +22,7 @@ from flask import Flask
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError, OperationalError, SQLAlchemyError
 
+from .article_write_claim import release_article_write, try_acquire_article_write
 from .extensions import db
 from .models import Article, AuthorSource, FastCrawlClaim
 from .time_utils import SHANGHAI_TZ, cn_now_naive
@@ -150,6 +151,8 @@ class FastCrawler:
         # 分布式 claim：按 gid 抢占 lease（MySQL 原子 upsert），尽量不漏且降低重复抓取/锁冲突。
         self.claim_enabled: bool = bool(cfg.get("FAST_CRAWL_CLAIM_ENABLED", True))
         self.claim_lease_seconds: int = int(cfg.get("FAST_CRAWL_CLAIM_LEASE_SECONDS", 900))
+        self.article_write_claim_enabled: bool = bool(cfg.get("ARTICLE_WRITE_CLAIM_ENABLED", True))
+        self.article_write_claim_lease_seconds: int = int(cfg.get("ARTICLE_WRITE_CLAIM_LEASE_SECONDS", 900))
         role = str(cfg.get("WORKER_ROLE") or "").strip()
         hostname = socket.gethostname()
         pid = os.getpid()
@@ -434,6 +437,7 @@ class FastCrawler:
             "conflict_retry": 0,
             "created": 0,
             "updated": 0,
+            "skip_write_claim": 0,
             "errors": 0,
         }
 
@@ -444,6 +448,7 @@ class FastCrawler:
                 stats["skip_no_info"] += 1
                 continue
 
+            release_article_row_id: Optional[int] = None
             try:
                 # Skip micro-headlines (group_source=5, no article content)
                 if info.get("group_source") == 5 or (not info.get("content") and info.get("thread")):
@@ -518,6 +523,7 @@ class FastCrawler:
                     try:
                         try:
                             skip_high_fans = False
+                            skip_write_claim = False
                             with db.session.begin_nested():
                                 author_row: Optional[AuthorSource] = None
                                 if author_url:
@@ -555,25 +561,42 @@ class FastCrawler:
                                         article = Article(article_id=gid, url_hash=url_hash, url=article_url)
                                         db.session.add(article)
 
-                                    self._apply_article_fields(
-                                        article,
-                                        article_url=article_url,
-                                        url_hash=url_hash,
-                                        title=title,
-                                        author=author,
-                                        author_url=author_url,
-                                        author_id=(author_row.id if author_row else None),
-                                        publish_ts=publish_ts,
-                                        published_at=published_at,
-                                        now=now,
-                                        content_html=content_html,
-                                        comment_count=comment_count,
-                                        view_count=view_count,
-                                        like_count=like_count,
-                                    )
-                                    db.session.flush()
+                                    if (
+                                        not is_new
+                                        and self.article_write_claim_enabled
+                                        and not try_acquire_article_write(
+                                            articles_row_id=int(article.id),
+                                            owner=self.claim_owner,
+                                            lease_seconds=self.article_write_claim_lease_seconds,
+                                        )
+                                    ):
+                                        skip_write_claim = True
+                                        stats["skip_write_claim"] += 1
+
+                                    if not skip_write_claim:
+                                        self._apply_article_fields(
+                                            article,
+                                            article_url=article_url,
+                                            url_hash=url_hash,
+                                            title=title,
+                                            author=author,
+                                            author_url=author_url,
+                                            author_id=(author_row.id if author_row else None),
+                                            publish_ts=publish_ts,
+                                            published_at=published_at,
+                                            now=now,
+                                            content_html=content_html,
+                                            comment_count=comment_count,
+                                            view_count=view_count,
+                                            like_count=like_count,
+                                        )
+                                        db.session.flush()
+                                        if not is_new:
+                                            release_article_row_id = int(article.id)
 
                             if skip_high_fans:
+                                break
+                            if skip_write_claim:
                                 break
                             if is_new:
                                 stats["created"] += 1
@@ -610,6 +633,16 @@ class FastCrawler:
                                 ).first()
                                 if not article:
                                     raise
+                                if (
+                                    self.article_write_claim_enabled
+                                    and not try_acquire_article_write(
+                                        articles_row_id=int(article.id),
+                                        owner=self.claim_owner,
+                                        lease_seconds=self.article_write_claim_lease_seconds,
+                                    )
+                                ):
+                                    stats["skip_write_claim"] += 1
+                                    break
                                 self._apply_article_fields(
                                     article,
                                     article_url=article_url,
@@ -627,6 +660,7 @@ class FastCrawler:
                                     like_count=like_count,
                                 )
                                 db.session.flush()
+                                release_article_row_id = int(article.id)
                             stats["updated"] += 1
                             affected += 1
                             break
@@ -661,16 +695,22 @@ class FastCrawler:
                     except Exception as commit_exc:
                         db.session.rollback()
                         logger.warning("fast_crawler per-item commit failed gid=%s err=%s", gid, commit_exc)
+                if release_article_row_id is not None and self.article_write_claim_enabled:
+                    release_article_write(
+                        articles_row_id=release_article_row_id,
+                        owner=self.claim_owner,
+                    )
 
         logger.info(
             "upsert summary candidates=%s info_ok=%s created=%s updated=%s "
             "skip_no_info=%s skip_micro=%s skip_video=%s skip_author=%s "
             "skip_fans=%s skip_time=%s skip_engagement=%s skip_content=%s skip_title=%s "
-            "conflict_retry=%s errors=%s",
+            "conflict_retry=%s skip_write_claim=%s errors=%s",
             stats["candidates"], stats["info_fetched"], stats["created"], stats["updated"],
             stats["skip_no_info"], stats["skip_micro"], stats["skip_video"], stats["skip_author"],
             stats["skip_fans"], stats["skip_time"], stats["skip_no_engagement"],
-            stats["skip_content"], stats["skip_title"], stats["conflict_retry"], stats["errors"],
+            stats["skip_content"], stats["skip_title"], stats["conflict_retry"], stats["skip_write_claim"],
+            stats["errors"],
         )
         return affected
 
