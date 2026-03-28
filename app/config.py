@@ -108,7 +108,7 @@ class Config:
     # and instead use `fast_crawl_claims` lease rows to ensure each gid is processed by
     # at most one worker at a time (claim can be re-acquired after expiry).
     FAST_CRAWL_CLAIM_ENABLED = os.getenv("FAST_CRAWL_CLAIM_ENABLED", "true").lower() == "true"
-    FAST_CRAWL_CLAIM_LEASE_SECONDS = int(os.getenv("FAST_CRAWL_CLAIM_LEASE_SECONDS", "300"))
+    FAST_CRAWL_CLAIM_LEASE_SECONDS = int(os.getenv("FAST_CRAWL_CLAIM_LEASE_SECONDS", "900"))
 
     # --- db.create_all distributed mutex (avoid MySQL 1684 concurrent DDL) ---
     DB_CREATE_ALL_LOCK_ENABLED = os.getenv("DB_CREATE_ALL_LOCK_ENABLED", "true").lower() == "true"
