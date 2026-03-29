@@ -12,7 +12,7 @@ def _sqlalchemy_engine_options() -> dict:
     contention vs the default REPEATABLE READ (MySQL InnoDB).
     Set MYSQL_TRANSACTION_ISOLATION=READ-COMMITTED to enable.
     """
-    raw = os.getenv("MYSQL_TRANSACTION_ISOLATION", "").strip().upper().replace(" ", "").replace("_", "")
+    raw = os.getenv("MYSQL_TRANSACTION_ISOLATION", "").strip().upper().replace(" ", "").replace("_", "").replace("-", "")
     if raw == "READCOMMITTED":
         return {
             "connect_args": {
