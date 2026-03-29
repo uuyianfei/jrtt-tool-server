@@ -17,8 +17,36 @@ rewrite_bp = Blueprint("rewrite", __name__)
 @rewrite_bp.post("/rewrite/start")
 def rewrite_start():
     body = request.get_json(silent=True) or {}
+    from_task_id = (body.get("fromTaskId") or "").strip()
+    if from_task_id:
+        old = RewriteTask.query.filter_by(task_id=from_task_id).first()
+        if not old:
+            return error_response(4004, "来源任务不存在")
+        url = (old.url or "").strip()
+        if not url:
+            return error_response(4001, "来源任务缺少 url")
+        article_id = (old.article_id or "").strip() or None
+        task_id = new_task_id()
+        task = RewriteTask(
+            task_id=task_id,
+            url=url,
+            article_id=article_id,
+            status="processing",
+            progress=0,
+            status_text="任务排队中...",
+            time_remaining=8,
+            source_html=old.source_html or "",
+            original_title=old.original_title,
+            cover=(old.cover or "")[:1024],
+        )
+        db.session.add(task)
+        db.session.commit()
+        start_rewrite_task(task_id)
+        return success_response({"taskId": task_id})
+
     url = (body.get("url") or "").strip()
     article_id = (body.get("articleId") or "").strip() or None
+    cover_seed = (body.get("cover") or "").strip()[:1024]
     if not url:
         return error_response(4001, "url 不能为空")
 
@@ -31,6 +59,7 @@ def rewrite_start():
         progress=0,
         status_text="任务排队中...",
         time_remaining=8,
+        cover=cover_seed,
     )
     db.session.add(task)
     db.session.commit()
@@ -56,6 +85,7 @@ def rewrite_status():
         "statusText": task.status_text,
         "timeRemaining": task.time_remaining,
         "sourceHtml": task.source_html or "",
+        "cover": (task.cover or "")[:1024],
     }
     if task.status == "completed":
         data["result"] = {

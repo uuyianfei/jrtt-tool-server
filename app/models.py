@@ -127,6 +127,8 @@ class RewriteTask(db.Model):
     time_remaining = db.Column(db.Integer, nullable=False, default=8)
 
     source_html = db.Column(db.Text, nullable=False, default="")
+    # 原文封面 URL（与 articles.cover 语义一致，供历史列表展示；删文后仍保留）
+    cover = db.Column(db.String(1024), nullable=False, default="")
     rewritten_body_html = db.Column(db.Text, nullable=True)
     original_title = db.Column(db.String(255), nullable=True)
     suggested_titles = db.Column(JSON, nullable=True)

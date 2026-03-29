@@ -12,7 +12,6 @@ services:
       CRAWL_JOB_ENABLED: "false"
       AUTHOR_COLLECT_JOB_ENABLED: "false"
       AUTHOR_ARTICLES_JOB_ENABLED: "false"
-      CLEANUP_JOB_ENABLED: "false"
       CRAWL_HEADLESS: "true"
       CHROMEDRIVER_PATH: ${CHROMEDRIVER_PATH:-/usr/bin/chromedriver}
       CHROME_BINARY_PATH: ${CHROME_BINARY_PATH:-/usr/bin/chromium}
@@ -36,11 +35,25 @@ services:
       FAST_CRAWL_MAX_HOURS: ${FAST_CRAWL_MAX_HOURS:-24}
       FAST_CRAWL_MAX_PAGES_PER_CHANNEL: ${FAST_CRAWL_MAX_PAGES_PER_CHANNEL:-50}
       FAST_CRAWL_REQUEST_DELAY: ${FAST_CRAWL_REQUEST_DELAY:-0.3}
+      # true：只写入新文章，不更新已有行（阅读量等仍可由 metrics-reconcile 刷新）
+      FAST_CRAWL_INSERT_ONLY: ${FAST_CRAWL_INSERT_ONLY:-true}
       CRAWL_JOB_ENABLED: "false"
       AUTHOR_COLLECT_JOB_ENABLED: "false"
       AUTHOR_ARTICLES_JOB_ENABLED: "false"
-      CLEANUP_JOB_ENABLED: "true"
       PYTHONUNBUFFERED: "1"
+
+  cleanup:
+    build:
+      context: .
+      dockerfile: Dockerfile.cleanup
+    container_name: jrtt-cleanup
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      PYTHONUNBUFFERED: "1"
+    command: ["python", "tools/run_cleanup.py", "--loop"]
 
   metrics-reconcile:
     build:

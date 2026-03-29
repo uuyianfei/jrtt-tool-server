@@ -7,6 +7,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from difflib import SequenceMatcher
+from typing import Optional
 from urllib.parse import urlsplit
 
 import requests
@@ -48,13 +49,15 @@ def _rewrite_worker(app, task_id: str):
             fetch_timeout = max(10, int(current_app.config.get("REWRITE_FETCH_TIMEOUT_SECONDS", 45)))
             ai_timeout = max(30, int(current_app.config.get("REWRITE_AI_TIMEOUT_SECONDS", 180)))
             _update_task(task, 10, "正在获取原文内容...", 7)
-            source_html, source_title, source_text = _run_with_timeout(
+            source_html, source_title, source_text, cover_url = _run_with_timeout(
                 _fetch_source,
                 timeout_seconds=fetch_timeout,
                 stage="fetch_source",
                 url=task.url,
+                task=task,
             )
             task.source_html = source_html
+            task.cover = ((cover_url or "").strip() or (task.cover or "").strip())[:1024]
             db.session.commit()
 
             _update_task(task, 40, "AI 正在分析结构...", 5)
@@ -134,6 +137,21 @@ def _rewrite_worker(app, task_id: str):
             logger.warning("rewrite task failed task_id=%s err=%s", task_id, exc)
 
 
+def _extract_cover_from_html(html: str) -> str:
+    """First image URL in HTML (same idea as fast_crawler), for fallback cover."""
+    if not html:
+        return ""
+    soup = BeautifulSoup(html, "html.parser")
+    for img in soup.find_all("img"):
+        src = (img.get("src") or img.get("data-src") or img.get("data-original") or "").strip()
+        if not src:
+            continue
+        if src.startswith("//"):
+            src = f"https:{src}"
+        return src[:1024]
+    return ""
+
+
 def _update_task(task: RewriteTask, progress: int, text: str, remain: int):
     task.progress = progress
     task.status_text = text
@@ -141,7 +159,7 @@ def _update_task(task: RewriteTask, progress: int, text: str, remain: int):
     db.session.commit()
 
 
-def _fetch_source(url: str):
+def _fetch_source(url: str, task: Optional[RewriteTask] = None):
     raw_url = _normalize_toutiao_input_url(url)
     resolved_url = _resolve_toutiao_short_url(raw_url)
     normalized_url = normalize_article_url(resolved_url or raw_url)
@@ -158,7 +176,17 @@ def _fetch_source(url: str):
         html = _sanitize_image_inline_styles(article.source_html)
         text = _html_to_text(html)
         _ensure_valid_source_content(normalized_url or raw_url, html, text)
-        return html, title, text
+        cover = ((article.cover or "").strip() or _extract_cover_from_html(html))[:1024]
+        return html, title, text, cover
+
+    # articles 行已被清理或从未入库：沿用本任务（或 fromTaskId 预填）里缓存的原文 HTML
+    if task and (task.source_html or "").strip():
+        html = _sanitize_image_inline_styles(task.source_html)
+        title = (task.original_title or "").strip() or "原标题"
+        text = _html_to_text(html)
+        _ensure_valid_source_content(normalized_url or raw_url, html, text)
+        cover = ((getattr(task, "cover", None) or "").strip() or _extract_cover_from_html(html))[:1024]
+        return html, title, text, cover
 
     if not _is_supported_toutiao_url(normalized_url):
         raise ValueError("仅支持头条文章链接，请检查链接是否完整可访问")
@@ -187,7 +215,8 @@ def _fetch_source(url: str):
     final_url = normalize_article_url(details.get("final_url") or "")
     text = _html_to_text(html)
     _ensure_valid_source_content(final_url or normalized_url, html, text)
-    return html, title, text
+    cover = _extract_cover_from_html(html)
+    return html, title, text, cover
 
 
 def _extract_group_id(url: str) -> str:
@@ -197,7 +226,7 @@ def _extract_group_id(url: str) -> str:
 
 
 def _fetch_via_info_api(url: str):
-    """Fetch article via mobile Info API. Returns (html, title, text) or None."""
+    """Fetch article via mobile Info API. Returns (html, title, text, cover) or None."""
     gid = _extract_group_id(url)
     if not gid:
         return None
@@ -225,7 +254,21 @@ def _fetch_via_info_api(url: str):
         title = (data.get("title") or "").strip() or "原标题"
         text = _html_to_text(content_html)
         _ensure_valid_source_content(url, content_html, text)
-        return content_html, title, text
+        cover = _extract_cover_from_html(content_html)
+        if not cover:
+            lit = data.get("large_image_list") or data.get("image_list") or []
+            if isinstance(lit, list) and lit:
+                first = lit[0]
+                if isinstance(first, dict):
+                    cover = (first.get("url") or "").strip()
+                    if cover.startswith("//"):
+                        cover = f"https:{cover}"
+                elif isinstance(first, str) and first.strip():
+                    cover = first.strip()
+                    if cover.startswith("//"):
+                        cover = f"https:{cover}"
+        cover = (cover or "")[:1024]
+        return content_html, title, text, cover
     except Exception as exc:
         logger.info("info api fetch failed gid=%s err=%s, falling back", gid, exc)
         return None

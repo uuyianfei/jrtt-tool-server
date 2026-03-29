@@ -26,9 +26,10 @@ class Config:
     CRAWL_INTERVAL_SECONDS = int(os.getenv("CRAWL_INTERVAL_SECONDS", "120"))
     CRAWL_DIRECT_RECOMMEND_ENABLED = os.getenv("CRAWL_DIRECT_RECOMMEND_ENABLED", "false").lower() == "true"
     CLEANUP_INTERVAL_MINUTES = int(os.getenv("CLEANUP_INTERVAL_MINUTES", "30"))
+    # 删除「发布时间/创建时间」早于此小时数的新闻（默认 24）
+    CLEANUP_ARTICLE_MAX_AGE_HOURS = int(os.getenv("CLEANUP_ARTICLE_MAX_AGE_HOURS", "24"))
     CLAIM_CLEANUP_RETENTION_HOURS = int(os.getenv("CLAIM_CLEANUP_RETENTION_HOURS", "24"))
     CRAWL_JOB_ENABLED = os.getenv("CRAWL_JOB_ENABLED", "true").lower() == "true"
-    CLEANUP_JOB_ENABLED = os.getenv("CLEANUP_JOB_ENABLED", "true").lower() == "true"
     AUTHOR_COLLECT_JOB_ENABLED = os.getenv("AUTHOR_COLLECT_JOB_ENABLED", "true").lower() == "true"
     AUTHOR_ARTICLES_JOB_ENABLED = os.getenv("AUTHOR_ARTICLES_JOB_ENABLED", "true").lower() == "true"
     CRAWL_TARGET_COUNT = int(os.getenv("CRAWL_TARGET_COUNT", "20"))
@@ -92,6 +93,8 @@ class Config:
     FAST_CRAWL_STARTUP_JITTER_SECONDS = int(os.getenv("FAST_CRAWL_STARTUP_JITTER_SECONDS", "20"))
     FAST_CRAWL_MIN_CONTENT_LENGTH = int(os.getenv("FAST_CRAWL_MIN_CONTENT_LENGTH", "80"))
     FAST_CRAWL_MAX_FANS = int(os.getenv("FAST_CRAWL_MAX_FANS", "0"))  # 0 = no limit
+    # true = 只 INSERT 新文章，不 UPDATE 已存在的行（metrics-reconcile 仍可刷新指标）
+    FAST_CRAWL_INSERT_ONLY = os.getenv("FAST_CRAWL_INSERT_ONLY", "false").lower() == "true"
     METRICS_RECONCILE_ENABLED = os.getenv("METRICS_RECONCILE_ENABLED", "false").lower() == "true"
     METRICS_RECONCILE_INTERVAL_SECONDS = int(os.getenv("METRICS_RECONCILE_INTERVAL_SECONDS", "60"))
     METRICS_RECONCILE_BATCH_SIZE = int(os.getenv("METRICS_RECONCILE_BATCH_SIZE", "30"))

@@ -31,7 +31,6 @@ def start_articles_worker(python_bin: str):
     env["AUTHOR_COLLECT_JOB_ENABLED"] = "false"
     env["AUTHOR_ARTICLES_JOB_ENABLED"] = "true"
     env["CRAWL_JOB_ENABLED"] = "false"
-    env["CLEANUP_JOB_ENABLED"] = "false"
     env["PYTHONUNBUFFERED"] = "1"
 
     cmd = [python_bin, "-u", "run_crawler.py"]

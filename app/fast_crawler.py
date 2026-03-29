@@ -14,7 +14,7 @@ import re
 import socket
 import time
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 
 import httpx
 from bs4 import BeautifulSoup
@@ -151,6 +151,7 @@ class FastCrawler:
         # 分布式 claim：按 gid 抢占 lease（MySQL 原子 upsert），尽量不漏且降低重复抓取/锁冲突。
         self.claim_enabled: bool = bool(cfg.get("FAST_CRAWL_CLAIM_ENABLED", True))
         self.claim_lease_seconds: int = int(cfg.get("FAST_CRAWL_CLAIM_LEASE_SECONDS", 900))
+        self.insert_only: bool = bool(cfg.get("FAST_CRAWL_INSERT_ONLY", False))
         self.article_write_claim_enabled: bool = bool(cfg.get("ARTICLE_WRITE_CLAIM_ENABLED", True))
         self.article_write_claim_lease_seconds: int = int(cfg.get("ARTICLE_WRITE_CLAIM_LEASE_SECONDS", 900))
         role = str(cfg.get("WORKER_ROLE") or "").strip()
@@ -417,6 +418,63 @@ class FastCrawler:
         article.metrics_checked_at = None
         article.metrics_error = ""
 
+    def _upsert_author_sources_committed(
+        self,
+        *,
+        author_url: str,
+        author_name: str,
+        author: str,
+        api_followers: int,
+        now: datetime,
+    ) -> Tuple[Optional[int], bool]:
+        """
+        Commit ``author_sources`` in its own transaction before touching ``articles``.
+
+        Holding locks on both tables in one unit of work makes ``INSERT INTO articles``
+        wait on FK-related or concurrent row locks until ``innodb_lock_wait_timeout``
+        (often ~50s), which matches production 1205 noise.
+        """
+        if not author_url:
+            if self.max_fans > 0 and int(api_followers) >= self.max_fans:
+                return None, True
+            return None, False
+
+        for attempt in range(1, 4):
+            try:
+                row = AuthorSource.query.filter(AuthorSource.author_url == author_url).first()
+                if row is None:
+                    row = AuthorSource(
+                        author_url=author_url,
+                        author_name=author_name or author,
+                        first_seen_at=now,
+                    )
+                    db.session.add(row)
+                else:
+                    if author_name:
+                        row.author_name = author_name
+                row.last_seen_at = now
+                if int(row.followers or 0) <= 0 and api_followers > 0:
+                    row.followers = int(api_followers)
+                db.session.flush()
+                _commit_with_retry()
+                break
+            except IntegrityError:
+                db.session.rollback()
+                if attempt >= 3:
+                    raise
+                continue
+
+        row = AuthorSource.query.filter(AuthorSource.author_url == author_url).first()
+        if row is None:
+            raise RuntimeError("author_sources missing after upsert")
+
+        candidate_fans = int(api_followers)
+        if int(row.followers or 0) > 0:
+            candidate_fans = int(row.followers or 0)
+        if self.max_fans > 0 and candidate_fans >= self.max_fans:
+            return int(row.id), True
+        return int(row.id), False
+
     def _filter_and_upsert(self, feed_items: List[Dict], info_map: Dict[str, Dict]) -> int:
         """Synchronous DB operations inside Flask app context."""
         now = cn_now_naive()
@@ -438,6 +496,7 @@ class FastCrawler:
             "created": 0,
             "updated": 0,
             "skip_write_claim": 0,
+            "skip_existing": 0,
             "errors": 0,
         }
 
@@ -515,6 +574,34 @@ class FastCrawler:
                 article_url = _normalize_article_url(gid)
                 url_hash = sha256_hex(article_url)
 
+                if self.insert_only:
+                    if (
+                        Article.query.filter(
+                            (Article.article_id == gid) | (Article.url_hash == url_hash)
+                        ).first()
+                        is not None
+                    ):
+                        stats["skip_existing"] += 1
+                        continue
+
+                try:
+                    committed_author_id, skip_high_fans = self._upsert_author_sources_committed(
+                        author_url=author_url,
+                        author_name=author_name,
+                        author=author,
+                        api_followers=api_followers,
+                        now=now,
+                    )
+                except Exception as auth_exc:
+                    stats["errors"] += 1
+                    db.session.rollback()
+                    logger.warning("author upsert failed gid=%s err=%s", gid, auth_exc)
+                    continue
+
+                if skip_high_fans:
+                    stats["skip_fans"] += 1
+                    continue
+
                 max_lock_tries = max(1, int(os.environ.get("FAST_CRAWL_DB_LOCK_MAX_TRIES", "6")))
                 lock_sleep_base = float(os.environ.get("FAST_CRAWL_DB_LOCK_SLEEP_SECONDS", "0.45"))
 
@@ -522,80 +609,53 @@ class FastCrawler:
                 while lock_attempt < max_lock_tries:
                     try:
                         try:
-                            skip_high_fans = False
                             skip_write_claim = False
                             with db.session.begin_nested():
-                                author_row: Optional[AuthorSource] = None
-                                if author_url:
-                                    author_row = AuthorSource.query.filter(
-                                        AuthorSource.author_url == author_url
-                                    ).first()
-                                    if author_row is None:
-                                        author_row = AuthorSource(
-                                            author_url=author_url,
-                                            author_name=author_name or author,
-                                            first_seen_at=now,
-                                        )
-                                        db.session.add(author_row)
-                                        db.session.flush()
-                                    else:
-                                        if author_name:
-                                            author_row.author_name = author_name
-                                    author_row.last_seen_at = now
-                                    # Fast lane only seeds followers if empty; accurate value comes from reconcile job.
-                                    if int(author_row.followers or 0) <= 0 and api_followers > 0:
-                                        author_row.followers = int(api_followers)
+                                article = Article.query.filter(
+                                    (Article.article_id == gid) | (Article.url_hash == url_hash)
+                                ).first()
+                                is_new = article is None
+                                if is_new:
+                                    article = Article(article_id=gid, url_hash=url_hash, url=article_url)
+                                    db.session.add(article)
+                                elif self.insert_only:
+                                    skip_write_claim = True
+                                    stats["skip_existing"] += 1
 
-                                candidate_fans = int(api_followers)
-                                if author_row and int(author_row.followers or 0) > 0:
-                                    candidate_fans = int(author_row.followers or 0)
-                                if self.max_fans > 0 and candidate_fans >= self.max_fans:
-                                    stats["skip_fans"] += 1
-                                    skip_high_fans = True
-                                else:
-                                    article = Article.query.filter(
-                                        (Article.article_id == gid) | (Article.url_hash == url_hash)
-                                    ).first()
-                                    is_new = article is None
-                                    if is_new:
-                                        article = Article(article_id=gid, url_hash=url_hash, url=article_url)
-                                        db.session.add(article)
+                                if (
+                                    not is_new
+                                    and not self.insert_only
+                                    and self.article_write_claim_enabled
+                                    and not try_acquire_article_write(
+                                        articles_row_id=int(article.id),
+                                        owner=self.claim_owner,
+                                        lease_seconds=self.article_write_claim_lease_seconds,
+                                    )
+                                ):
+                                    skip_write_claim = True
+                                    stats["skip_write_claim"] += 1
 
-                                    if (
-                                        not is_new
-                                        and self.article_write_claim_enabled
-                                        and not try_acquire_article_write(
-                                            articles_row_id=int(article.id),
-                                            owner=self.claim_owner,
-                                            lease_seconds=self.article_write_claim_lease_seconds,
-                                        )
-                                    ):
-                                        skip_write_claim = True
-                                        stats["skip_write_claim"] += 1
+                                if not skip_write_claim:
+                                    self._apply_article_fields(
+                                        article,
+                                        article_url=article_url,
+                                        url_hash=url_hash,
+                                        title=title,
+                                        author=author,
+                                        author_url=author_url,
+                                        author_id=committed_author_id,
+                                        publish_ts=publish_ts,
+                                        published_at=published_at,
+                                        now=now,
+                                        content_html=content_html,
+                                        comment_count=comment_count,
+                                        view_count=view_count,
+                                        like_count=like_count,
+                                    )
+                                    db.session.flush()
+                                    if not is_new:
+                                        release_article_row_id = int(article.id)
 
-                                    if not skip_write_claim:
-                                        self._apply_article_fields(
-                                            article,
-                                            article_url=article_url,
-                                            url_hash=url_hash,
-                                            title=title,
-                                            author=author,
-                                            author_url=author_url,
-                                            author_id=(author_row.id if author_row else None),
-                                            publish_ts=publish_ts,
-                                            published_at=published_at,
-                                            now=now,
-                                            content_html=content_html,
-                                            comment_count=comment_count,
-                                            view_count=view_count,
-                                            like_count=like_count,
-                                        )
-                                        db.session.flush()
-                                        if not is_new:
-                                            release_article_row_id = int(article.id)
-
-                            if skip_high_fans:
-                                break
                             if skip_write_claim:
                                 break
                             if is_new:
@@ -605,28 +665,21 @@ class FastCrawler:
                             affected += 1
                             break
                         except IntegrityError:
+                            db.session.rollback()
+                            if self.insert_only:
+                                stats["skip_existing"] += 1
+                                break
                             # Another crawler may insert the same row first.
                             stats["conflict_retry"] += 1
                             with db.session.begin_nested():
-                                author_row = None
-                                if author_url:
-                                    author_row = AuthorSource.query.filter(
-                                        AuthorSource.author_url == author_url
-                                    ).first()
-                                    if author_row is None:
-                                        author_row = AuthorSource(
-                                            author_url=author_url,
-                                            author_name=author_name or author,
-                                            first_seen_at=now,
-                                        )
-                                        db.session.add(author_row)
-                                        db.session.flush()
-                                    else:
+                                if author_url and committed_author_id is not None:
+                                    author_row = db.session.get(AuthorSource, committed_author_id)
+                                    if author_row is not None:
                                         if author_name:
                                             author_row.author_name = author_name
-                                    author_row.last_seen_at = now
-                                    if int(author_row.followers or 0) <= 0 and api_followers > 0:
-                                        author_row.followers = int(api_followers)
+                                        author_row.last_seen_at = now
+                                        if int(author_row.followers or 0) <= 0 and api_followers > 0:
+                                            author_row.followers = int(api_followers)
 
                                 article = Article.query.filter(
                                     (Article.article_id == gid) | (Article.url_hash == url_hash)
@@ -650,7 +703,7 @@ class FastCrawler:
                                     title=title,
                                     author=author,
                                     author_url=author_url,
-                                    author_id=(author_row.id if author_row else None),
+                                    author_id=committed_author_id,
                                     publish_ts=publish_ts,
                                     published_at=published_at,
                                     now=now,
@@ -705,12 +758,12 @@ class FastCrawler:
             "upsert summary candidates=%s info_ok=%s created=%s updated=%s "
             "skip_no_info=%s skip_micro=%s skip_video=%s skip_author=%s "
             "skip_fans=%s skip_time=%s skip_engagement=%s skip_content=%s skip_title=%s "
-            "conflict_retry=%s skip_write_claim=%s errors=%s",
+            "conflict_retry=%s skip_write_claim=%s skip_existing=%s errors=%s",
             stats["candidates"], stats["info_fetched"], stats["created"], stats["updated"],
             stats["skip_no_info"], stats["skip_micro"], stats["skip_video"], stats["skip_author"],
             stats["skip_fans"], stats["skip_time"], stats["skip_no_engagement"],
             stats["skip_content"], stats["skip_title"], stats["conflict_retry"], stats["skip_write_claim"],
-            stats["errors"],
+            stats["skip_existing"], stats["errors"],
         )
         return affected
 

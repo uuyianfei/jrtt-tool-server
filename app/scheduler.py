@@ -4,7 +4,6 @@ from datetime import datetime, timedelta
 from apscheduler.schedulers.background import BackgroundScheduler
 
 from .crawler import (
-    cleanup_expired_articles,
     run_author_articles_job,
     run_author_articles_loop,
     run_author_collect_job,
@@ -25,11 +24,9 @@ class AppScheduler:
         author_collect_seconds = app.config["AUTHOR_COLLECT_INTERVAL_SECONDS"]
         author_articles_seconds = app.config["AUTHOR_CRAWL_INTERVAL_SECONDS"]
         author_articles_continuous = bool(app.config.get("AUTHOR_ARTICLES_CONTINUOUS_ENABLED", True))
-        cleanup_minutes = app.config["CLEANUP_INTERVAL_MINUTES"]
         job_jitter = int(app.config.get("JOB_JITTER_SECONDS", 0))
         crawl_enabled = bool(app.config.get("CRAWL_JOB_ENABLED", True))
         crawl_direct_recommend_enabled = bool(app.config.get("CRAWL_DIRECT_RECOMMEND_ENABLED", False))
-        cleanup_enabled = bool(app.config.get("CLEANUP_JOB_ENABLED", True))
         author_collect_enabled = bool(app.config.get("AUTHOR_COLLECT_JOB_ENABLED", True))
         author_articles_enabled = bool(app.config.get("AUTHOR_ARTICLES_JOB_ENABLED", True))
 
@@ -42,13 +39,6 @@ class AppScheduler:
                         run_crawl_job()
                 except Exception as exc:
                     logger.exception("crawl job error: %s", exc)
-
-        def cleanup_wrapper():
-            with app.app_context():
-                try:
-                    cleanup_expired_articles()
-                except Exception as exc:
-                    logger.exception("cleanup job error: %s", exc)
 
         def author_collect_wrapper():
             with app.app_context():
@@ -126,20 +116,6 @@ class AppScheduler:
                 logger.warning("legacy crawl job enabled; may overlap with dual-line jobs")
         else:
             logger.info("legacy crawl job disabled by CRAWL_JOB_ENABLED=false")
-
-        if cleanup_enabled:
-            self.scheduler.add_job(
-                cleanup_wrapper,
-                trigger="interval",
-                minutes=cleanup_minutes,
-                id="cleanup_job",
-                replace_existing=True,
-                max_instances=1,
-                next_run_time=datetime.now(),
-                jitter=job_jitter,
-            )
-        else:
-            logger.info("cleanup job disabled by CLEANUP_JOB_ENABLED=false")
 
     def start(self):
         if not self.started:
