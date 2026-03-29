@@ -425,6 +425,12 @@ def reconcile_checked_once(
                 row.metrics_error = "missing article_id"
                 row.metrics_checked_at = now
                 failed_reasons["missing_article_id"] = int(failed_reasons.get("missing_article_id", 0)) + 1
+                # Per-row commit: release lock immediately
+                try:
+                    _commit_with_retry()
+                except Exception as commit_exc:
+                    db.session.rollback()
+                    current_app.logger.warning("checked-refresh per-row commit failed gid=%s err=%s", gid, commit_exc)
                 continue
             try:
                 info = fetch_info_api(gid)
@@ -435,21 +441,20 @@ def reconcile_checked_once(
                     row.metrics_error = "info api empty"
                     row.metrics_checked_at = now
                     failed_reasons["info_api_empty"] = int(failed_reasons.get("info_api_empty", 0)) + 1
-                    continue
-
-                row.view_count = int(info.get("impression_count") or row.view_count or 0)
-                row.like_count = int(info.get("digg_count") or row.like_count or 0)
-                row.comment_count = int(
-                    max(
-                        int(info.get("comment_count") or 0),
-                        int(row.comment_count or 0),
+                else:
+                    row.view_count = int(info.get("impression_count") or row.view_count or 0)
+                    row.like_count = int(info.get("digg_count") or row.like_count or 0)
+                    row.comment_count = int(
+                        max(
+                            int(info.get("comment_count") or 0),
+                            int(row.comment_count or 0),
+                        )
                     )
-                )
-                # checked 刷新模式：保持 checked，只更新校准时间
-                row.metrics_status = "checked"
-                row.metrics_checked_at = now
-                row.metrics_error = ""
-                checked_refreshed += 1
+                    # checked 刷新模式：保持 checked，只更新校准时间
+                    row.metrics_status = "checked"
+                    row.metrics_checked_at = now
+                    row.metrics_error = ""
+                    checked_refreshed += 1
             except Exception as exc:
                 failed += 1
                 # Backoff: 写入失败原因，避免该行在排序里持续被命中
@@ -460,9 +465,15 @@ def reconcile_checked_once(
                 row.metrics_error = f"checked-refresh exception: {reason}: {err_msg}"[:500]
                 row.metrics_checked_at = now
             finally:
+                # Per-row commit: each row's UPDATE is committed immediately,
+                # so locks are held for ms instead of the entire batch duration.
+                try:
+                    _commit_with_retry()
+                except Exception as commit_exc:
+                    db.session.rollback()
+                    current_app.logger.warning("checked-refresh per-row commit failed gid=%s err=%s", gid, commit_exc)
                 time.sleep(max(0.0, float(request_delay)))
 
-        _commit_with_retry()
         return {
             "picked": picked,
             "checked_refreshed": checked_refreshed,
@@ -641,7 +652,7 @@ def reconcile_once(
             _commit_with_retry()
             author_followers_map = {aid: int(a.followers or 0) for aid, a in authors_map.items()}
 
-        # 2) Refresh per-article metrics and status
+        # 2) Refresh per-article metrics and status (per-row commit)
         for row in rows:
             if aw_enabled and row.id not in write_claim_acquired:
                 continue
@@ -656,6 +667,11 @@ def reconcile_once(
                 row.metrics_status = "failed"
                 row.metrics_error = "missing article_id"
                 failed += 1
+                try:
+                    _commit_with_retry()
+                except Exception as commit_exc:
+                    db.session.rollback()
+                    current_app.logger.warning("reconcile per-row commit failed gid=%s err=%s", gid, commit_exc)
                 continue
 
             try:
@@ -664,44 +680,49 @@ def reconcile_once(
                     row.metrics_status = "failed"
                     row.metrics_error = "info api empty"
                     failed += 1
-                    continue
-
-                row.view_count = int(info.get("impression_count") or prev_view or 0)
-                row.like_count = int(info.get("digg_count") or prev_like or 0)
-                row.comment_count = int(
-                    max(
-                        int(info.get("comment_count") or 0),
-                        int(prev_comment or 0),
-                    )
-                )
-
-                author_ok = (
-                    author_id is not None
-                    and int(author_id) in claimed_author_ids_set
-                    and int(author_followers_map.get(int(author_id)) or 0) > 0
-                )
-                if author_ok:
-                    row.metrics_status = "checked"
-                    row.metrics_checked_at = now
-                    row.metrics_error = ""
-                    checked += 1
                 else:
-                    # 作者粉丝获取失败（或本轮没拿到 claim）：保持可重试状态 pending。
-                    row.metrics_status = "pending"
-                    row.metrics_checked_at = None
-                    if author_id is not None and int(author_id) not in claimed_author_ids_set:
-                        row.metrics_error = "author followers not claimed"
+                    row.view_count = int(info.get("impression_count") or prev_view or 0)
+                    row.like_count = int(info.get("digg_count") or prev_like or 0)
+                    row.comment_count = int(
+                        max(
+                            int(info.get("comment_count") or 0),
+                            int(prev_comment or 0),
+                        )
+                    )
+
+                    author_ok = (
+                        author_id is not None
+                        and int(author_id) in claimed_author_ids_set
+                        and int(author_followers_map.get(int(author_id)) or 0) > 0
+                    )
+                    if author_ok:
+                        row.metrics_status = "checked"
+                        row.metrics_checked_at = now
+                        row.metrics_error = ""
+                        checked += 1
                     else:
-                        row.metrics_error = "author followers unavailable"
-                    pending_author_followers_unavailable += 1
+                        # 作者粉丝获取失败（或本轮没拿到 claim）：保持可重试状态 pending。
+                        row.metrics_status = "pending"
+                        row.metrics_checked_at = None
+                        if author_id is not None and int(author_id) not in claimed_author_ids_set:
+                            row.metrics_error = "author followers not claimed"
+                        else:
+                            row.metrics_error = "author followers unavailable"
+                        pending_author_followers_unavailable += 1
             except Exception as exc:
                 row.metrics_status = "failed"
                 row.metrics_error = str(exc)[:500]
                 failed += 1
             finally:
+                # Per-row commit: each row's UPDATE is committed immediately,
+                # so locks are held for ms instead of the entire batch duration.
+                try:
+                    _commit_with_retry()
+                except Exception as commit_exc:
+                    db.session.rollback()
+                    current_app.logger.warning("reconcile per-row commit failed gid=%s err=%s", gid, commit_exc)
                 time.sleep(max(0.0, float(request_delay)))
 
-        _commit_with_retry()
         return {
             "picked": len(rows),
             "checked": checked,

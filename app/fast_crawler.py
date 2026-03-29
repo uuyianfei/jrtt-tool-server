@@ -636,6 +636,27 @@ class FastCrawler:
                                     stats["skip_write_claim"] += 1
 
                                 if not skip_write_claim:
+                                    # 新行先 INSERT 且 author_id=NULL，再 UPDATE 补 author_id。
+                                    # 若 INSERT 即带 FK，InnoDB 需对 author_sources 对应行加锁，
+                                    # 与粉丝刷新/其他写作者行的事务并发时易 1205。
+                                    if is_new:
+                                        self._apply_article_fields(
+                                            article,
+                                            article_url=article_url,
+                                            url_hash=url_hash,
+                                            title=title,
+                                            author=author,
+                                            author_url=author_url,
+                                            author_id=None,
+                                            publish_ts=publish_ts,
+                                            published_at=published_at,
+                                            now=now,
+                                            content_html=content_html,
+                                            comment_count=comment_count,
+                                            view_count=view_count,
+                                            like_count=like_count,
+                                        )
+                                        db.session.flush()
                                     self._apply_article_fields(
                                         article,
                                         article_url=article_url,

@@ -6,6 +6,22 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
+def _sqlalchemy_engine_options() -> dict:
+    """
+    Optional per-connection isolation. READ COMMITTED can reduce some gap/next-key
+    contention vs the default REPEATABLE READ (MySQL InnoDB).
+    Set MYSQL_TRANSACTION_ISOLATION=READ-COMMITTED to enable.
+    """
+    raw = os.getenv("MYSQL_TRANSACTION_ISOLATION", "").strip().upper().replace(" ", "").replace("_", "")
+    if raw == "READCOMMITTED":
+        return {
+            "connect_args": {
+                "init_command": "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED",
+            },
+        }
+    return {}
+
+
 class Config:
     APP_ENV = os.getenv("APP_ENV", "dev")
     DEBUG = os.getenv("DEBUG", "false").lower() == "true"
@@ -22,6 +38,7 @@ class Config:
         "?charset=utf8mb4"
     )
     SQLALCHEMY_TRACK_MODIFICATIONS = False
+    SQLALCHEMY_ENGINE_OPTIONS = _sqlalchemy_engine_options()
 
     CRAWL_INTERVAL_SECONDS = int(os.getenv("CRAWL_INTERVAL_SECONDS", "120"))
     CRAWL_DIRECT_RECOMMEND_ENABLED = os.getenv("CRAWL_DIRECT_RECOMMEND_ENABLED", "false").lower() == "true"
@@ -29,6 +46,12 @@ class Config:
     # 删除「发布时间/创建时间」早于此小时数的新闻（默认 24）
     CLEANUP_ARTICLE_MAX_AGE_HOURS = int(os.getenv("CLEANUP_ARTICLE_MAX_AGE_HOURS", "24"))
     CLAIM_CLEANUP_RETENTION_HOURS = int(os.getenv("CLAIM_CLEANUP_RETENTION_HOURS", "24"))
+    # 清理任务单次 DELETE 行数上限，减小批次可降低与爬虫/metrics 并发时的 InnoDB 锁等待 (1205)
+    CLEANUP_DELETE_BATCH_SIZE = int(os.getenv("CLEANUP_DELETE_BATCH_SIZE", "200"))
+    # 每批 DELETE 后休眠（秒），给其他事务让出锁窗口
+    CLEANUP_BATCH_SLEEP_SECONDS = float(os.getenv("CLEANUP_BATCH_SLEEP_SECONDS", "0.5"))
+    # 每批 DELETE 遇到 1205/1213 时的重试次数
+    CLEANUP_BATCH_MAX_RETRIES = int(os.getenv("CLEANUP_BATCH_MAX_RETRIES", "3"))
     CRAWL_JOB_ENABLED = os.getenv("CRAWL_JOB_ENABLED", "true").lower() == "true"
     AUTHOR_COLLECT_JOB_ENABLED = os.getenv("AUTHOR_COLLECT_JOB_ENABLED", "true").lower() == "true"
     AUTHOR_ARTICLES_JOB_ENABLED = os.getenv("AUTHOR_ARTICLES_JOB_ENABLED", "true").lower() == "true"
